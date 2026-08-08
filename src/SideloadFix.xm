@@ -16,34 +16,90 @@
 
 %hook NSFileManager
 - (NSURL *)containerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
-	if (NSURL *ourAppGroupURL = getAppGroupPathIfExists()) {
-		NSURL *fakeAppGroupURL = [ourAppGroupURL URLByAppendingPathComponent:groupIdentifier];
-		createDirectoryIfNotExists(fakeAppGroupURL.path);
-		return fakeAppGroupURL;
+	NSURL *appGroupURL = getAppGroupPathIfExists();
+	if (appGroupURL) {
+		return appGroupURL;
 	}
+	return %orig(groupIdentifier);
+}
 
-	NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-	NSString *fakePath = [[paths lastObject] stringByAppendingPathComponent:groupIdentifier];
-	createDirectoryIfNotExists(fakePath);
-	return [NSURL fileURLWithPath:fakePath];
+- (BOOL)fileExistsAtPath:(NSString *)path {
+	return %orig(canonicalizedSideloadPath(path));
+}
+
+- (BOOL)fileExistsAtPath:(NSString *)path isDirectory:(BOOL *)isDirectory {
+	return %orig(canonicalizedSideloadPath(path), isDirectory);
+}
+
+- (BOOL)createDirectoryAtPath:(NSString *)path withIntermediateDirectories:(BOOL)createIntermediates attributes:(NSDictionary *)attributes error:(NSError **)error {
+	return %orig(canonicalizedSideloadPath(path), createIntermediates, attributes, error);
+}
+
+- (BOOL)createFileAtPath:(NSString *)path contents:(NSData *)data attributes:(NSDictionary *)attributes {
+	return %orig(canonicalizedSideloadPath(path), data, attributes);
+}
+
+- (NSData *)contentsAtPath:(NSString *)path {
+	return %orig(canonicalizedSideloadPath(path));
+}
+
+- (NSArray<NSString *> *)contentsOfDirectoryAtPath:(NSString *)path error:(NSError **)error {
+	return %orig(canonicalizedSideloadPath(path), error);
+}
+
+- (NSDictionary *)attributesOfItemAtPath:(NSString *)path error:(NSError **)error {
+	return %orig(canonicalizedSideloadPath(path), error);
+}
+
+- (BOOL)removeItemAtPath:(NSString *)path error:(NSError **)error {
+	return %orig(canonicalizedSideloadPath(path), error);
+}
+
+- (BOOL)copyItemAtPath:(NSString *)srcPath toPath:(NSString *)dstPath error:(NSError **)error {
+	return %orig(canonicalizedSideloadPath(srcPath), canonicalizedSideloadPath(dstPath), error);
+}
+
+- (BOOL)moveItemAtPath:(NSString *)srcPath toPath:(NSString *)dstPath error:(NSError **)error {
+	return %orig(canonicalizedSideloadPath(srcPath), canonicalizedSideloadPath(dstPath), error);
+}
+
+- (BOOL)createDirectoryAtURL:(NSURL *)url withIntermediateDirectories:(BOOL)createIntermediates attributes:(NSDictionary *)attributes error:(NSError **)error {
+	return %orig(canonicalizedSideloadURL(url), createIntermediates, attributes, error);
+}
+
+- (BOOL)removeItemAtURL:(NSURL *)url error:(NSError **)error {
+	return %orig(canonicalizedSideloadURL(url), error);
+}
+
+- (BOOL)copyItemAtURL:(NSURL *)srcURL toURL:(NSURL *)dstURL error:(NSError **)error {
+	return %orig(canonicalizedSideloadURL(srcURL), canonicalizedSideloadURL(dstURL), error);
+}
+
+- (BOOL)moveItemAtURL:(NSURL *)srcURL toURL:(NSURL *)dstURL error:(NSError **)error {
+	return %orig(canonicalizedSideloadURL(srcURL), canonicalizedSideloadURL(dstURL), error);
+}
+
+- (NSArray<NSURL *> *)contentsOfDirectoryAtURL:(NSURL *)url includingPropertiesForKeys:(NSArray<NSURLResourceKey> *)keys options:(NSDirectoryEnumerationOptions)mask error:(NSError **)error {
+	return %orig(canonicalizedSideloadURL(url), keys, mask, error);
 }
 %end
 
 %hook NSUserDefaults
 - (id)_initWithSuiteName:(NSString *)suiteName container:(NSURL *)container {
-	NSURL *appGroupURL = getAppGroupPathIfExists();
-	if (!appGroupURL) {
-		return %orig(suiteName, container);
-	}
-
 	if (![suiteName hasPrefix:@"group"]) {
 		return %orig(suiteName, container);
 	}
 
-	if (NSURL *customContainerURL = [appGroupURL URLByAppendingPathComponent:suiteName]) {
-		return %orig(suiteName, customContainerURL);
+	NSURL *appGroupURL = getAppGroupPathIfExists();
+	if (appGroupURL) {
+		return %orig(suiteName, appGroupURL);
 	}
-
 	return %orig(suiteName, container);
 }
 %end
+
+%ctor {
+	migrateLegacyMobileConfigIfNeeded();
+	rebindPathFuncs();
+	%init;
+}
