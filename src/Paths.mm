@@ -1,3 +1,4 @@
+#import <dlfcn.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <stdlib.h>
@@ -10,6 +11,9 @@ static NSURL *gPreferredRealAppGroupURL = nil;
 static NSDictionary *gOriginalEntitlements = nil;
 static NSDictionary *gOriginalGroupContainerURLs = nil;
 static dispatch_once_t gAppGroupMappingOnce;
+
+typedef CFTypeRef (*ZXSecTaskCreateFromSelfFn)(CFAllocatorRef allocator);
+typedef CFTypeRef (*ZXSecTaskCopyValueForEntitlementFn)(CFTypeRef task, CFStringRef entitlement, CFErrorRef *error);
 
 static NSArray<NSString *> *knownMetaAppGroupIdentifiers(void) {
 	static NSArray<NSString *> *identifiers = nil;
@@ -44,6 +48,40 @@ static id runtimeSendObject(id target, SEL selector) {
 		return nil;
 	}
 	return ((id (*)(id, SEL))objc_msgSend)(target, selector);
+}
+
+static NSDictionary *taskEntitlements(void) {
+	ZXSecTaskCreateFromSelfFn createTask = (ZXSecTaskCreateFromSelfFn)dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
+	ZXSecTaskCopyValueForEntitlementFn copyEntitlement = (ZXSecTaskCopyValueForEntitlementFn)dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+	if (!createTask || !copyEntitlement) {
+		return nil;
+	}
+
+	CFTypeRef task = createTask(kCFAllocatorDefault);
+	if (!task) {
+		return nil;
+	}
+
+	NSMutableDictionary *entitlements = [NSMutableDictionary dictionary];
+	for (NSString *key in @[@"com.apple.security.application-groups", @"application-identifier"]) {
+		CFTypeRef value = copyEntitlement(task, (__bridge CFStringRef)key, NULL);
+		if (value) {
+			entitlements[key] = CFBridgingRelease(value);
+		}
+	}
+	CFRelease(task);
+	return entitlements.count ? [entitlements copy] : nil;
+}
+
+static NSDictionary *bundleProxyEntitlements(NSDictionary **containerURLsOut) {
+	Class proxyClass = NSClassFromString(@"LSBundleProxy");
+	id proxy = runtimeSendObject((id)proxyClass, sel_registerName("bundleProxyForCurrentProcess"));
+	NSDictionary *entitlements = runtimeSendObject(proxy, sel_registerName("entitlements"));
+	NSDictionary *containerURLs = runtimeSendObject(proxy, sel_registerName("groupContainerURLs"));
+	if (containerURLsOut) {
+		*containerURLsOut = [containerURLs isKindOfClass:[NSDictionary class]] ? containerURLs : nil;
+	}
+	return [entitlements isKindOfClass:[NSDictionary class]] ? entitlements : nil;
 }
 
 static NSURL *URLFromGroupContainerValue(id value) {
@@ -91,7 +129,6 @@ static NSArray<NSString *> *orderedCandidateGroups(NSArray<NSString *> *signedGr
 			[ordered addObject:candidate];
 		}
 	}
-
 	for (NSString *candidate in signedGroups) {
 		if (![ordered containsObject:candidate]) {
 			[ordered addObject:candidate];
@@ -102,23 +139,23 @@ static NSArray<NSString *> *orderedCandidateGroups(NSArray<NSString *> *signedGr
 
 void initializeAppGroupMapping(void) {
 	dispatch_once(&gAppGroupMappingOnce, ^{
-		// LSBundleProxy is private. Resolve it dynamically so the dylib never
-		// carries an undefined _OBJC_CLASS_$_LSBundleProxy link dependency.
-		Class proxyClass = NSClassFromString(@"LSBundleProxy");
-		id proxy = runtimeSendObject((id)proxyClass, sel_registerName("bundleProxyForCurrentProcess"));
-		NSDictionary *entitlements = runtimeSendObject(proxy, sel_registerName("entitlements"));
-		NSDictionary *containerURLs = runtimeSendObject(proxy, sel_registerName("groupContainerURLs"));
+		NSDictionary *proxyContainerURLs = nil;
+		NSDictionary *proxyEntitlements = bundleProxyEntitlements(&proxyContainerURLs);
+		NSDictionary *signedEntitlements = taskEntitlements();
 
-		gOriginalEntitlements = [entitlements isKindOfClass:[NSDictionary class]] ? [entitlements copy] : @{};
-		gOriginalGroupContainerURLs = [containerURLs isKindOfClass:[NSDictionary class]] ? [containerURLs copy] : @{};
+		// SecTask reflects the process' actual code-signing entitlements and does
+		// not depend on LSBundleProxy being initialized yet. Prefer it at startup.
+		NSDictionary *entitlements = signedEntitlements ?: proxyEntitlements ?: @{};
+		gOriginalEntitlements = [entitlements copy];
+		gOriginalGroupContainerURLs = [proxyContainerURLs copy] ?: @{};
 		gSignedApplicationGroups = normalizedSignedGroups(gOriginalEntitlements);
 
 		NSFileManager *fileManager = [NSFileManager defaultManager];
 		for (NSString *groupIdentifier in orderedCandidateGroups(gSignedApplicationGroups, gOriginalEntitlements)) {
 			NSURL *URL = URLFromGroupContainerValue(gOriginalGroupContainerURLs[groupIdentifier]);
 			if (!URL) {
-				// Runs before %init, so this is Foundation's real lookup for the
-				// genuinely signed identifier, not our alias hook.
+				// This runs before %init, so this is Foundation's genuine entitlement
+				// check for an identifier that is actually present in the signature.
 				URL = [fileManager containerURLForSecurityApplicationGroupIdentifier:groupIdentifier];
 			}
 			if (URL) {
@@ -206,10 +243,7 @@ static BOOL createDirectoryIfNotExists(NSString *path) {
 	if ([fileManager fileExistsAtPath:path isDirectory:&isDirectory]) {
 		return isDirectory;
 	}
-	return [fileManager createDirectoryAtPath:path
-		withIntermediateDirectories:YES
-		attributes:nil
-		error:nil];
+	return [fileManager createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
 }
 
 NSURL *sideloadFallbackAppGroupURL(void) {
