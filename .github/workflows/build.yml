@@ -24,6 +24,7 @@ jobs:
     env:
       SDK_NAME: iPhoneOS26.2.sdk
       THEOS: ${{ github.workspace }}/theos
+      EXPECTED_INSTALL_NAME: '@executable_path/Frameworks/zxPluginsInject.dylib'
 
     steps:
       - name: Checkout project
@@ -68,10 +69,12 @@ jobs:
       - name: Validate toolchain
         run: |
           command -v ldid
+          command -v install_name_tool
           ldid -h >/dev/null 2>&1 || true
           test -d "$THEOS/sdks/$SDK_NAME"
           test -f main/Makefile
           grep -q '^ARCHS := arm64$' main/Makefile
+          grep -Fq '@executable_path/Frameworks/$(TWEAK_NAME).dylib' main/Makefile
 
       - name: Build zxPluginsInject.dylib
         run: |
@@ -79,7 +82,7 @@ jobs:
           make clean
           make FINALPACKAGE=1 TARGET=iphone:clang:26.2:14.0
 
-      - name: Collect and verify dylib
+      - name: Normalize install name, sign and verify dylib
         run: |
           cd main
           mkdir -p artifacts
@@ -89,9 +92,22 @@ jobs:
             find .theos -maxdepth 6 -type f -print || true
             exit 1
           fi
+
+          CURRENT_ID="$(otool -D "$DYLIB" | tail -n +2 | head -n 1 | xargs)"
+          if [ "$CURRENT_ID" != "$EXPECTED_INSTALL_NAME" ]; then
+            install_name_tool -id "$EXPECTED_INSTALL_NAME" "$DYLIB"
+          fi
+
+          ldid -S "$DYLIB"
+
+          FINAL_ID="$(otool -D "$DYLIB" | tail -n +2 | head -n 1 | xargs)"
+          test "$FINAL_ID" = "$EXPECTED_INSTALL_NAME"
+
           cp "$DYLIB" artifacts/zxPluginsInject.dylib
           file artifacts/zxPluginsInject.dylib
           otool -hv artifacts/zxPluginsInject.dylib
+          otool -D artifacts/zxPluginsInject.dylib
+          otool -L artifacts/zxPluginsInject.dylib
           shasum -a 256 artifacts/zxPluginsInject.dylib | tee artifacts/SHA256SUMS.txt
 
       - name: Upload dylib
