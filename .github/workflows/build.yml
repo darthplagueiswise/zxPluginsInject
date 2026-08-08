@@ -1,0 +1,62 @@
+name: Build zxPluginsInject
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build dylib
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          brew install make
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Install Theos
+        env:
+          THEOS: ${{ runner.temp }}/theos
+        run: |
+          git clone --depth=1 --recursive https://github.com/theos/theos.git "$THEOS"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: Build zxPluginsInject.dylib
+        run: |
+          make clean
+          make FINALPACKAGE=1 TARGET=iphone:clang:latest:14.0
+
+      - name: Collect and verify dylib
+        run: |
+          mkdir -p artifacts
+          DYLIB="$(find .theos/obj -type f -name 'zxPluginsInject.dylib' -print -quit)"
+          if [ -z "$DYLIB" ]; then
+            echo 'zxPluginsInject.dylib was not produced.' >&2
+            find .theos -maxdepth 5 -type f -print || true
+            exit 1
+          fi
+          cp "$DYLIB" artifacts/zxPluginsInject.dylib
+          file artifacts/zxPluginsInject.dylib
+          otool -hv artifacts/zxPluginsInject.dylib
+          shasum -a 256 artifacts/zxPluginsInject.dylib | tee artifacts/SHA256SUMS.txt
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: zxPluginsInject-dylib
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
