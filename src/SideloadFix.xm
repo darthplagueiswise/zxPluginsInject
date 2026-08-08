@@ -18,31 +18,31 @@
 }
 %end
 
+%hook LSBundleProxy
+- (NSDictionary *)entitlements {
+	NSDictionary *entitlements = %orig;
+	return mappedApplicationGroupEntitlements(entitlements);
+}
+
+- (NSDictionary *)groupContainerURLs {
+	NSDictionary *containerURLs = %orig;
+	return mappedGroupContainerURLs(containerURLs);
+}
+%end
+
 %hook NSFileManager
 - (NSURL *)containerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
-	// Preserve a container that iOS can already resolve. This is important for
-	// apps that were resigned with their original App Group still available.
 	NSURL *URL = %orig(groupIdentifier);
-	if (URL || groupIdentifier.length == 0 || ![groupIdentifier hasPrefix:@"group."]) {
+	if (URL) {
 		return URL;
 	}
 
-	// Forum asks METAAppGroup for original Meta group identifiers that are not
-	// present in the resigned profile. Resolve those requests through a REAL
-	// application group present in the current process' signed entitlements.
-	for (NSString *signedGroup in signedApplicationGroups()) {
-		if ([signedGroup isEqualToString:groupIdentifier]) {
-			continue;
-		}
-		URL = %orig(signedGroup);
-		if (URL) {
-			return URL;
-		}
+	// Do not hijack arbitrary third-party groups. Only original Meta-family group
+	// identifiers are aliases for the real group carried by the resigned build.
+	if (!isMetaAppGroupIdentifier(groupIdentifier)) {
+		return nil;
 	}
 
-	// LSBundleProxy can still expose the real group URL even when the public
-	// NSFileManager lookup did not. Keep Documents/AppGroup only as the final
-	// generic sideload fallback, never as the preferred Forum container.
 	URL = preferredRealAppGroupURL();
 	return URL ?: sideloadFallbackAppGroupURL();
 }
@@ -54,18 +54,21 @@
 	if (URL) {
 		return URL;
 	}
+
+	// METAAppGroup has already resolved a symbolic group name (for example
+	// "app") by this point. If the original Meta entitlement is unavailable,
+	// provide the one real cross-process App Group selected from this signature.
 	return getAppGroupPathIfExists();
 }
 %end
 
 %hook NSUserDefaults
 - (id)_initWithSuiteName:(NSString *)suiteName container:(NSURL *)container {
-	if (![suiteName hasPrefix:@"group."]) {
+	if (!isMetaAppGroupIdentifier(suiteName)) {
 		return %orig(suiteName, container);
 	}
 
-	NSURL *mappedContainer = [[NSFileManager defaultManager]
-		containerURLForSecurityApplicationGroupIdentifier:suiteName];
+	NSURL *mappedContainer = preferredRealAppGroupURL();
 	return %orig(suiteName, mappedContainer ?: container);
 }
 %end
@@ -77,9 +80,9 @@
 		return path;
 	}
 
-	// FBMobileConfigAdvancedSettingsViewController looks for its pmap assets in
-	// mobileconfig_res/, while this Forum IPA packages the exact resources in
-	// params_maps/. Redirect only that missing resource directory lookup.
+	// This Forum build packages the pmap resources under params_maps/, while
+	// FBMobileConfigAdvancedSettingsViewController asks for mobileconfig_res/.
+	// Keep the fix constrained to this one missing bundle-resource directory.
 	return %orig(name, extension, @"params_maps");
 }
 
@@ -93,5 +96,9 @@
 %end
 
 %ctor {
+	// Resolve the genuine signed group BEFORE installing LSBundleProxy and
+	// NSFileManager hooks. This prevents recursive alias resolution and ensures
+	// every Meta alias points at an actual iOS-managed shared container.
+	initializeAppGroupMapping();
 	%init;
 }
