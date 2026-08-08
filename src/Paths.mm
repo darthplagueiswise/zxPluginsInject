@@ -29,11 +29,6 @@ static void initializePathConstants() {
 	});
 }
 
-static NSString *documentsPath() {
-	initializePathConstants();
-	return gDocumentsPath;
-}
-
 BOOL createDirectoryIfNotExists(NSString *path) {
 	if (path.length == 0) {
 		return NO;
