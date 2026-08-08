@@ -1,14 +1,37 @@
 #import <objc/runtime.h>
+#import <stdlib.h>
 
 #import "Header.h"
 
+static NSString *gHomePath = nil;
+static NSString *gDocumentsPath = nil;
+static NSString *gAppGroupPath = nil;
+static NSString *gHomeMobileConfigPath = nil;
+static NSString *gDocumentsMobileConfigPath = nil;
+static NSString *gCanonicalMobileConfigPath = nil;
+static dispatch_once_t gPathConstantsOnce;
+static __thread BOOL gCanonicalizingSideloadPath = NO;
+
+static void initializePathConstants() {
+	dispatch_once(&gPathConstantsOnce, ^{
+		const char *homeCString = getenv("HOME");
+		NSString *home = homeCString ? [NSString stringWithUTF8String:homeCString] : nil;
+		if (home.length == 0) {
+			home = NSHomeDirectory();
+		}
+
+		gHomePath = [home copy];
+		gDocumentsPath = [[gHomePath stringByAppendingPathComponent:@"Documents"] copy];
+		gAppGroupPath = [[gDocumentsPath stringByAppendingPathComponent:@"AppGroup"] copy];
+		gHomeMobileConfigPath = [[gHomePath stringByAppendingPathComponent:@"mobileconfig"] copy];
+		gDocumentsMobileConfigPath = [[gDocumentsPath stringByAppendingPathComponent:@"mobileconfig"] copy];
+		gCanonicalMobileConfigPath = [[gAppGroupPath stringByAppendingPathComponent:@"mobileconfig"] copy];
+	});
+}
+
 static NSString *documentsPath() {
-	NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-	NSString *path = [paths lastObject];
-	if (path.length == 0) {
-		path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-	}
-	return [path stringByStandardizingPath];
+	initializePathConstants();
+	return gDocumentsPath;
 }
 
 BOOL createDirectoryIfNotExists(NSString *path) {
@@ -35,9 +58,9 @@ NSURL *getAppGroupPathIfExists() {
 	static dispatch_once_t onceToken;
 
 	dispatch_once(&onceToken, ^{
-		NSString *path = [documentsPath() stringByAppendingPathComponent:@"AppGroup"];
-		if (createDirectoryIfNotExists(path)) {
-			cachedAppGroupPath = [NSURL fileURLWithPath:path isDirectory:YES];
+		initializePathConstants();
+		if (createDirectoryIfNotExists(gAppGroupPath)) {
+			cachedAppGroupPath = [NSURL fileURLWithPath:gAppGroupPath isDirectory:YES];
 		}
 	});
 
@@ -48,49 +71,42 @@ static BOOL pathIsEqualToOrInsidePath(NSString *path, NSString *prefix) {
 	if (path.length == 0 || prefix.length == 0) {
 		return NO;
 	}
-
-	NSString *standardPath = [path stringByStandardizingPath];
-	NSString *standardPrefix = [prefix stringByStandardizingPath];
-	if ([standardPath isEqualToString:standardPrefix]) {
+	if ([path isEqualToString:prefix]) {
 		return YES;
 	}
 
-	NSString *prefixWithSlash = [standardPrefix stringByAppendingString:@"/"];
-	return [standardPath hasPrefix:prefixWithSlash];
+	NSString *prefixWithSlash = [prefix stringByAppendingString:@"/"];
+	return [path hasPrefix:prefixWithSlash];
 }
 
 NSString *canonicalizedSideloadPath(NSString *path) {
-	if (path.length == 0) {
+	if (path.length == 0 || gCanonicalizingSideloadPath) {
 		return path;
 	}
 
-	NSString *standardPath = [path stringByStandardizingPath];
-	NSString *homeMobileConfig = [[NSHomeDirectory() stringByStandardizingPath] stringByAppendingPathComponent:@"mobileconfig"];
-	NSString *documentsMobileConfig = [documentsPath() stringByAppendingPathComponent:@"mobileconfig"];
-	NSURL *appGroupURL = getAppGroupPathIfExists();
-	if (!appGroupURL) {
-		return standardPath;
-	}
+	gCanonicalizingSideloadPath = YES;
+	initializePathConstants();
 
-	NSString *targetMobileConfig = [appGroupURL.path stringByAppendingPathComponent:@"mobileconfig"];
-	NSArray<NSString *> *legacyPrefixes = @[homeMobileConfig, documentsMobileConfig];
+	NSString *result = path;
+	NSArray<NSString *> *legacyPrefixes = @[gHomeMobileConfigPath, gDocumentsMobileConfigPath];
 	for (NSString *legacyPrefix in legacyPrefixes) {
-		if (!pathIsEqualToOrInsidePath(standardPath, legacyPrefix)) {
+		if (!pathIsEqualToOrInsidePath(path, legacyPrefix)) {
 			continue;
 		}
 
-		NSString *suffix = [standardPath substringFromIndex:legacyPrefix.length];
+		NSString *suffix = [path substringFromIndex:legacyPrefix.length];
 		if ([suffix hasPrefix:@"/"]) {
 			suffix = [suffix substringFromIndex:1];
 		}
 
-		if (suffix.length == 0) {
-			return targetMobileConfig;
-		}
-		return [targetMobileConfig stringByAppendingPathComponent:suffix];
+		result = suffix.length == 0
+			? gCanonicalMobileConfigPath
+			: [gCanonicalMobileConfigPath stringByAppendingPathComponent:suffix];
+		break;
 	}
 
-	return standardPath;
+	gCanonicalizingSideloadPath = NO;
+	return result;
 }
 
 NSURL *canonicalizedSideloadURL(NSURL *url) {
@@ -170,26 +186,21 @@ static BOOL mergeLegacyItem(NSFileManager *fileManager, NSString *sourcePath, NS
 }
 
 void migrateLegacyMobileConfigIfNeeded() {
+	initializePathConstants();
 	NSURL *appGroupURL = getAppGroupPathIfExists();
 	if (!appGroupURL) {
 		return;
 	}
 
 	NSFileManager *fileManager = [NSFileManager defaultManager];
-	NSString *targetPath = [appGroupURL.path stringByAppendingPathComponent:@"mobileconfig"];
-	NSString *homePath = [NSHomeDirectory() stringByStandardizingPath];
-	NSString *documents = documentsPath();
-	NSArray<NSString *> *legacyPaths = @[
-		[homePath stringByAppendingPathComponent:@"mobileconfig"],
-		[documents stringByAppendingPathComponent:@"mobileconfig"]
-	];
+	NSArray<NSString *> *legacyPaths = @[gHomeMobileConfigPath, gDocumentsMobileConfigPath];
 
 	for (NSString *legacyPath in legacyPaths) {
-		if ([legacyPath isEqualToString:targetPath]) {
+		if ([legacyPath isEqualToString:gCanonicalMobileConfigPath]) {
 			continue;
 		}
-		mergeLegacyItem(fileManager, legacyPath, targetPath);
+		mergeLegacyItem(fileManager, legacyPath, gCanonicalMobileConfigPath);
 	}
 
-	createDirectoryIfNotExists(targetPath);
+	createDirectoryIfNotExists(gCanonicalMobileConfigPath);
 }
