@@ -4,6 +4,10 @@
 - (NSURL *)containerURL;
 @end
 
+@interface FBMobileConfigAdvancedSettingsViewController : NSObject
+- (NSString *)getParamsMapPath:(NSString *)resourceName;
+@end
+
 %hook CKContainer
 - (id)_setupWithContainerID:(id)a options:(id)b { return nil; }
 - (id)_initWithContainerIdentifier:(id)a { return nil; }
@@ -37,8 +41,6 @@
 		return URL;
 	}
 
-	// Do not hijack arbitrary third-party groups. Only original Meta-family group
-	// identifiers are aliases for the real group carried by the resigned build.
 	if (!isMetaAppGroupIdentifier(groupIdentifier)) {
 		return nil;
 	}
@@ -54,10 +56,6 @@
 	if (URL) {
 		return URL;
 	}
-
-	// METAAppGroup has already resolved a symbolic group name (for example
-	// "app") by this point. If the original Meta entitlement is unavailable,
-	// provide the one real cross-process App Group selected from this signature.
 	return getAppGroupPathIfExists();
 }
 %end
@@ -73,32 +71,29 @@
 }
 %end
 
-%hook NSBundle
-- (NSString *)pathForResource:(NSString *)name ofType:(NSString *)extension inDirectory:(NSString *)subpath {
-	NSString *path = %orig(name, extension, subpath);
-	if (path || self != [NSBundle mainBundle] || ![subpath isEqualToString:@"mobileconfig_res"]) {
+%hook FBMobileConfigAdvancedSettingsViewController
+- (NSString *)getParamsMapPath:(NSString *)resourceName {
+	NSString *path = %orig(resourceName);
+	if (path.length > 0 || resourceName.length == 0) {
 		return path;
 	}
 
-	// This Forum build packages the pmap resources under params_maps/, while
-	// FBMobileConfigAdvancedSettingsViewController asks for mobileconfig_res/.
-	// Keep the fix constrained to this one missing bundle-resource directory.
-	return %orig(name, extension, @"params_maps");
-}
-
-- (NSURL *)URLForResource:(NSString *)name withExtension:(NSString *)extension subdirectory:(NSString *)subpath {
-	NSURL *URL = %orig(name, extension, subpath);
-	if (URL || self != [NSBundle mainBundle] || ![subpath isEqualToString:@"mobileconfig_res"]) {
-		return URL;
-	}
-	return %orig(name, extension, @"params_maps");
+	// Forum's Advanced Settings asks for mobileconfig_res/<name>.txt, while the
+	// shipped IPA stores the same resources in params_maps/. Hook the exact
+	// consumer instead of globally changing NSBundle resource semantics.
+	NSString *fileName = resourceName.pathExtension.length > 0
+		? resourceName
+		: [resourceName stringByAppendingPathExtension:@"txt"];
+	NSString *candidate = [[[[NSBundle mainBundle] bundlePath]
+		stringByAppendingPathComponent:@"params_maps"]
+		stringByAppendingPathComponent:fileName];
+	return [[NSFileManager defaultManager] fileExistsAtPath:candidate] ? candidate : path;
 }
 %end
 
 %ctor {
-	// Resolve the genuine signed group BEFORE installing LSBundleProxy and
-	// NSFileManager hooks. This prevents recursive alias resolution and ensures
-	// every Meta alias points at an actual iOS-managed shared container.
+	// Resolve the genuine signed group before installing the aliases. SecTask is
+	// used by Paths.mm first, so this does not depend on LSBundleProxy startup.
 	initializeAppGroupMapping();
 	%init;
 }
