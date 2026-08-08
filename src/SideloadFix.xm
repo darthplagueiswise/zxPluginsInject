@@ -1,3 +1,4 @@
+#import <objc/runtime.h>
 #import "Header.h"
 
 @interface METAAppGroup : NSObject
@@ -6,7 +7,170 @@
 
 @interface FBMobileConfigAdvancedSettingsViewController : NSObject
 - (NSString *)getParamsMapPath:(NSString *)resourceName;
+- (id)_cellForSchemaSection:(NSInteger)section forTableView:(id)tableView;
 @end
+
+static BOOL zxParseV2ParamsMapAtPath(NSString *path, NSString **hashOut, NSArray<NSString *> **paramsOut) {
+	if (path.length == 0 || ![[NSFileManager defaultManager] isReadableFileAtPath:path]) {
+		return NO;
+	}
+
+	NSError *error = nil;
+	NSString *contents = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&error];
+	if (contents.length == 0 || error) {
+		return NO;
+	}
+
+	NSArray<NSString *> *lines = [contents componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+	if (lines.count < 2) {
+		return NO;
+	}
+
+	NSString *header = [lines.firstObject stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	NSArray<NSString *> *headerFields = [header componentsSeparatedByString:@","];
+	if (headerFields.count < 3 || ![headerFields[0] isEqualToString:@"v2"] || [headerFields[1] length] == 0) {
+		return NO;
+	}
+
+	NSMutableArray<NSString *> *params = [NSMutableArray array];
+	for (NSUInteger index = 1; index < lines.count; index++) {
+		NSString *line = [lines[index] stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+		if ([line isEqualToString:@"END"]) {
+			break;
+		}
+		if (line.length == 0 || [line hasPrefix:@"*"]) {
+			continue;
+		}
+		[params addObject:line];
+	}
+
+	if (params.count == 0) {
+		return NO;
+	}
+
+	if (hashOut) {
+		*hashOut = [headerFields[1] copy];
+	}
+	if (paramsOut) {
+		*paramsOut = [params copy];
+	}
+	return YES;
+}
+
+static void zxAppendRuntimeMapCandidate(NSMutableArray<NSString *> *candidates, NSString *path) {
+	if (path.length > 0 && ![candidates containsObject:path]) {
+		[candidates addObject:path];
+	}
+}
+
+static void zxAppendRuntimeMapsFromContainer(NSMutableArray<NSString *> *candidates, NSURL *containerURL) {
+	if (!containerURL.isFileURL || containerURL.path.length == 0) {
+		return;
+	}
+
+	NSString *mobileConfigRoot = [containerURL.path stringByAppendingPathComponent:@"mobileconfig"];
+	zxAppendRuntimeMapCandidate(candidates, [[mobileConfigRoot stringByAppendingPathComponent:@"sessionless.data"] stringByAppendingPathComponent:@"params_map.txt"]);
+
+	NSError *error = nil;
+	NSArray<NSString *> *children = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:mobileConfigRoot error:&error];
+	if (!children || error) {
+		return;
+	}
+	for (NSString *child in children) {
+		if (![child hasSuffix:@".data"] || [child isEqualToString:@"sessionless.data"]) {
+			continue;
+		}
+		zxAppendRuntimeMapCandidate(candidates, [[[mobileConfigRoot stringByAppendingPathComponent:child]
+			stringByAppendingPathComponent:@"params_map.txt"] copy]);
+	}
+}
+
+static NSString *zxFindForumMGParamsMap(void) {
+	NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+
+	// First use the genuine App Group selected from the current signature.
+	zxAppendRuntimeMapsFromContainer(candidates, preferredRealAppGroupURL());
+
+	// Forum also intentionally maintains a process-local sessionless store.
+	NSArray<NSString *> *documentsURLs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+	NSString *documentsPath = documentsURLs.firstObject;
+	if (documentsPath.length > 0) {
+		zxAppendRuntimeMapCandidate(candidates, [[[[documentsPath stringByAppendingPathComponent:@"mobileconfig"]
+			stringByAppendingPathComponent:@"sessionless.data"]
+			stringByAppendingPathComponent:@"params_map.txt"] copy]);
+
+		// Compatibility with the AppGroup directory used by older sideload fixes.
+		zxAppendRuntimeMapCandidate(candidates, [[[[[documentsPath stringByAppendingPathComponent:@"AppGroup"]
+			stringByAppendingPathComponent:@"mobileconfig"]
+			stringByAppendingPathComponent:@"sessionless.data"]
+			stringByAppendingPathComponent:@"params_map.txt"] copy]);
+	}
+
+	// The IPA ships the same schema family under params_maps; this is a safe
+	// bootstrap only when no runtime MobileConfig map has been materialized yet.
+	zxAppendRuntimeMapCandidate(candidates, [[[[NSBundle mainBundle] bundlePath]
+		stringByAppendingPathComponent:@"params_maps"]
+		stringByAppendingPathComponent:@"params_map.txt"]);
+
+	for (NSString *candidate in candidates) {
+		NSString *hash = nil;
+		NSArray<NSString *> *params = nil;
+		if (zxParseV2ParamsMapAtPath(candidate, &hash, &params)) {
+			return candidate;
+		}
+	}
+	return nil;
+}
+
+static BOOL zxReadForumMGSchema(NSString **hashOut, NSArray<NSString *> **paramsOut) {
+	NSString *path = zxFindForumMGParamsMap();
+	return zxParseV2ParamsMapAtPath(path, hashOut, paramsOut);
+}
+
+extern void objc_storeStrong(id *object, id value);
+
+static BOOL zxSetStrongObjectIvar(id object, const char *name, id value) {
+	if (!object || !name) {
+		return NO;
+	}
+	Ivar ivar = class_getInstanceVariable([object class], name);
+	if (!ivar || ivar_getTypeEncoding(ivar)[0] != '@') {
+		return NO;
+	}
+	ptrdiff_t offset = ivar_getOffset(ivar);
+	uint8_t *base = (uint8_t *)(__bridge void *)object;
+	id __strong *slot = (id __strong *)(base + offset);
+	objc_storeStrong(slot, value);
+	return YES;
+}
+
+static void zxPopulateForumMGSchema(id controller) {
+	if (!controller) {
+		return;
+	}
+
+	Ivar hashIvar = class_getInstanceVariable([controller class], "updatedHash_");
+	Ivar listIvar = class_getInstanceVariable([controller class], "updatedList_");
+	if (!hashIvar || !listIvar) {
+		return;
+	}
+
+	id existingHash = object_getIvar(controller, hashIvar);
+	id existingList = object_getIvar(controller, listIvar);
+	if ([existingHash isKindOfClass:[NSString class]] && [existingHash length] > 0 &&
+		[existingList respondsToSelector:@selector(count)] && [existingList count] > 0) {
+		return;
+	}
+
+	NSString *hash = nil;
+	NSArray<NSString *> *params = nil;
+	if (!zxReadForumMGSchema(&hash, &params)) {
+		return;
+	}
+
+	zxSetStrongObjectIvar(controller, "updatedHash_", hash);
+	zxSetStrongObjectIvar(controller, "updatedList_", params);
+}
 
 %hook CKContainer
 - (id)_setupWithContainerID:(id)a options:(id)b { return nil; }
@@ -78,9 +242,6 @@
 		return path;
 	}
 
-	// Forum's Advanced Settings asks for mobileconfig_res/<name>.txt, while the
-	// shipped IPA stores the same resources in params_maps/. Hook the exact
-	// consumer instead of globally changing NSBundle resource semantics.
 	NSString *fileName = resourceName.pathExtension.length > 0
 		? resourceName
 		: [resourceName stringByAppendingPathExtension:@"txt"];
@@ -89,11 +250,17 @@
 		stringByAppendingPathComponent:fileName];
 	return [[NSFileManager defaultManager] fileExistsAtPath:candidate] ? candidate : path;
 }
+
+- (id)_cellForSchemaSection:(NSInteger)section forTableView:(id)tableView {
+	// Populate mg from the real MobileConfig v2 map immediately before Forum
+	// renders the schema cell. No executable text is modified and Forum's own
+	// schema-cell implementation still formats/displays the values.
+	zxPopulateForumMGSchema(self);
+	return %orig(section, tableView);
+}
 %end
 
 %ctor {
-	// Resolve the genuine signed group before installing the aliases. SecTask is
-	// used by Paths.mm first, so this does not depend on LSBundleProxy startup.
 	initializeAppGroupMapping();
 	%init;
 }
