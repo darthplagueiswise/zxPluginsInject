@@ -7,6 +7,7 @@ TWEAK_NAME := zxPluginsInject
 
 $(TWEAK_NAME)_FILES := $(shell find src -type f -name "*.*m") fishhook/fishhook.c
 $(TWEAK_NAME)_CFLAGS := -fobjc-arc -Os
+$(TWEAK_NAME)_CXXFLAGS := -std=c++17
 $(TWEAK_NAME)_LDFLAGS := -Wl,-install_name,@executable_path/Frameworks/$(TWEAK_NAME).dylib
 $(TWEAK_NAME)_LOGOS_DEFAULT_GENERATOR := internal
 
