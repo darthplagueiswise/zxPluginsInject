@@ -6,7 +6,7 @@ NSString *bundleId;
 static void setRequiredIDs() {
 	NSDictionary *query = @{
 		(__bridge NSString *)kSecClass: (__bridge NSString *)kSecClassGenericPassword,
-		(__bridge NSString *)kSecAttrAccount: @"zxPluginsInjectGenericEntry",
+		(__bridge NSString *)kSecAttrAccount: @"bundleSeedID",
 		(__bridge NSString *)kSecAttrService: @"",
 		(__bridge id)kSecReturnAttributes: (id)kCFBooleanTrue
 	};
@@ -22,7 +22,7 @@ static void setRequiredIDs() {
 	
 	bundleId = [[NSBundle mainBundle] bundleIdentifier];
 	accessGroupId = [(__bridge NSDictionary *)result objectForKey:(__bridge NSString *)kSecAttrAccessGroup];
-	if (result) {  // uhh, okay
+	if (result) {
 		CFRelease(result);
 	}
 }
