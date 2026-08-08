@@ -4,51 +4,89 @@ on:
   push:
     branches:
       - main
-    paths-ignore:
-      - '**/*.md'
   pull_request:
     branches:
       - main
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build dylib
+    name: Build dylib (arm64, SDK 26.2)
     runs-on: macos-latest
 
+    env:
+      SDK_NAME: iPhoneOS26.2.sdk
+      THEOS: ${{ github.workspace }}/theos
+
     steps:
-      - name: Checkout
+      - name: Checkout project
         uses: actions/checkout@v4
         with:
+          path: main
           submodules: recursive
 
-      - name: Install build dependencies
-        run: |
-          brew install make
-          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+      - name: Install dependencies
+        run: brew install ldid dpkg make
 
-      - name: Install Theos
-        env:
-          THEOS: ${{ runner.temp }}/theos
+      - name: Set GNU make PATH
+        run: echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Setup Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          ref: master
+          path: theos
+          submodules: recursive
+
+      - name: Cache iOS SDK
+        id: sdk
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/theos/sdks/
+          key: ${{ runner.os }}-iPhoneOS26.2.sdk
+          restore-keys: |
+            ${{ runner.os }}-iPhoneOS26.2.sdk
+
+      - name: Download iOS 26.2 SDK
+        if: steps.sdk.outputs.cache-hit != 'true'
         run: |
-          git clone --depth=1 --recursive https://github.com/theos/theos.git "$THEOS"
-          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          git clone --quiet -n --depth=1 --filter=tree:0 https://github.com/xybp888/iOS-SDKs/
+          cd iOS-SDKs
+          git sparse-checkout set --no-cone "$SDK_NAME"
+          git checkout
+          mkdir -p "$THEOS/sdks"
+          mv *.sdk "$THEOS/sdks"
+
+      - name: Validate toolchain
+        run: |
+          command -v ldid
+          ldid -h >/dev/null 2>&1 || true
+          test -d "$THEOS/sdks/$SDK_NAME"
+          test -f main/Makefile
+          grep -q '^ARCHS := arm64$' main/Makefile
 
       - name: Build zxPluginsInject.dylib
         run: |
+          cd main
           make clean
-          make FINALPACKAGE=1 TARGET=iphone:clang:latest:14.0
+          make FINALPACKAGE=1 TARGET=iphone:clang:26.2:14.0
 
       - name: Collect and verify dylib
         run: |
+          cd main
           mkdir -p artifacts
           DYLIB="$(find .theos/obj -type f -name 'zxPluginsInject.dylib' -print -quit)"
           if [ -z "$DYLIB" ]; then
             echo 'zxPluginsInject.dylib was not produced.' >&2
-            find .theos -maxdepth 5 -type f -print || true
+            find .theos -maxdepth 6 -type f -print || true
             exit 1
           fi
           cp "$DYLIB" artifacts/zxPluginsInject.dylib
@@ -59,7 +97,7 @@ jobs:
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
-          name: zxPluginsInject-dylib
-          path: artifacts/
+          name: zxPluginsInject-dylib-${{ github.run_number }}
+          path: main/artifacts/
           if-no-files-found: error
           retention-days: 30
