@@ -288,11 +288,13 @@ static void zxPopulateForumMGSchemaWithOriginalParser(id controller) {
 
 %hook LSBundleProxy
 - (NSDictionary *)entitlements {
-	return mappedApplicationGroupEntitlements(%orig);
+	NSDictionary *entitlements = %orig;
+	return mappedApplicationGroupEntitlements(entitlements);
 }
 
 - (NSDictionary *)groupContainerURLs {
-	NSDictionary *mapped = mappedGroupContainerURLs(%orig);
+	NSDictionary *containerURLs = %orig;
+	NSDictionary *mapped = mappedGroupContainerURLs(containerURLs);
 	if (!zxIsForumProcess() || ![mapped isKindOfClass:[NSDictionary class]]) {
 		return mapped;
 	}
