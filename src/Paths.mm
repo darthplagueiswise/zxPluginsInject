@@ -1,3 +1,5 @@
+#import <objc/message.h>
+#import <objc/runtime.h>
 #import <stdlib.h>
 
 #import "Header.h"
@@ -37,6 +39,13 @@ static NSArray<NSString *> *knownMetaAppGroupIdentifiers(void) {
 	return identifiers;
 }
 
+static id runtimeSendObject(id target, SEL selector) {
+	if (!target || !selector || ![target respondsToSelector:selector]) {
+		return nil;
+	}
+	return ((id (*)(id, SEL))objc_msgSend)(target, selector);
+}
+
 static NSURL *URLFromGroupContainerValue(id value) {
 	if ([value isKindOfClass:[NSURL class]]) {
 		return value;
@@ -65,9 +74,6 @@ static NSArray<NSString *> *normalizedSignedGroups(NSDictionary *entitlements) {
 static NSArray<NSString *> *orderedCandidateGroups(NSArray<NSString *> *signedGroups, NSDictionary *entitlements) {
 	NSMutableArray<NSString *> *ordered = [NSMutableArray array];
 
-	// Prefer the group matching the bundle identifier embedded in the resigning
-	// application-identifier entitlement. Example:
-	// S4Q99652S6.ryuk2.anoxclan.com -> group.ryuk2.anoxclan.com.
 	NSString *applicationIdentifier = entitlements[@"application-identifier"];
 	if ([applicationIdentifier isKindOfClass:[NSString class]]) {
 		NSRange separator = [applicationIdentifier rangeOfString:@"."];
@@ -80,8 +86,6 @@ static NSArray<NSString *> *orderedCandidateGroups(NSArray<NSString *> *signedGr
 		}
 	}
 
-	// Known Forum/Ryuk signing groups remain stable fallbacks, but are only used
-	// when they are actually present in this process' signed entitlements.
 	for (NSString *candidate in @[@"group.ryuk2.anoxclan.com", @"group.com.anoxclan.ryuk"]) {
 		if ([signedGroups containsObject:candidate] && ![ordered containsObject:candidate]) {
 			[ordered addObject:candidate];
@@ -98,9 +102,12 @@ static NSArray<NSString *> *orderedCandidateGroups(NSArray<NSString *> *signedGr
 
 void initializeAppGroupMapping(void) {
 	dispatch_once(&gAppGroupMappingOnce, ^{
-		LSBundleProxy *proxy = [LSBundleProxy bundleProxyForCurrentProcess];
-		NSDictionary *entitlements = proxy.entitlements;
-		NSDictionary *containerURLs = proxy.groupContainerURLs;
+		// LSBundleProxy is private. Resolve it dynamically so the dylib never
+		// carries an undefined _OBJC_CLASS_$_LSBundleProxy link dependency.
+		Class proxyClass = NSClassFromString(@"LSBundleProxy");
+		id proxy = runtimeSendObject((id)proxyClass, sel_registerName("bundleProxyForCurrentProcess"));
+		NSDictionary *entitlements = runtimeSendObject(proxy, sel_registerName("entitlements"));
+		NSDictionary *containerURLs = runtimeSendObject(proxy, sel_registerName("groupContainerURLs"));
 
 		gOriginalEntitlements = [entitlements isKindOfClass:[NSDictionary class]] ? [entitlements copy] : @{};
 		gOriginalGroupContainerURLs = [containerURLs isKindOfClass:[NSDictionary class]] ? [containerURLs copy] : @{};
@@ -110,8 +117,8 @@ void initializeAppGroupMapping(void) {
 		for (NSString *groupIdentifier in orderedCandidateGroups(gSignedApplicationGroups, gOriginalEntitlements)) {
 			NSURL *URL = URLFromGroupContainerValue(gOriginalGroupContainerURLs[groupIdentifier]);
 			if (!URL) {
-				// This executes before the Logos hooks are installed, so it is the real
-				// Foundation App Group lookup for the signed identifier.
+				// Runs before %init, so this is Foundation's real lookup for the
+				// genuinely signed identifier, not our alias hook.
 				URL = [fileManager containerURLForSecurityApplicationGroupIdentifier:groupIdentifier];
 			}
 			if (URL) {
@@ -142,11 +149,9 @@ BOOL isMetaAppGroupIdentifier(NSString *groupIdentifier) {
 	if (![groupIdentifier isKindOfClass:[NSString class]] || groupIdentifier.length == 0) {
 		return NO;
 	}
-
 	if ([knownMetaAppGroupIdentifiers() containsObject:groupIdentifier]) {
 		return YES;
 	}
-
 	return [groupIdentifier hasPrefix:@"group.com.facebook."] ||
 		[groupIdentifier hasPrefix:@"group.com.facebookwork."] ||
 		[groupIdentifier hasPrefix:@"group.com.metaplatforms."] ||
