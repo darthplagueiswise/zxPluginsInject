@@ -1,3 +1,4 @@
+#import <dlfcn.h>
 #import <objc/runtime.h>
 #import "Header.h"
 
@@ -88,10 +89,8 @@ static void zxAppendRuntimeMapsFromContainer(NSMutableArray<NSString *> *candida
 static NSString *zxFindForumMGParamsMap(void) {
 	NSMutableArray<NSString *> *candidates = [NSMutableArray array];
 
-	// First use the genuine App Group selected from the current signature.
 	zxAppendRuntimeMapsFromContainer(candidates, preferredRealAppGroupURL());
 
-	// Forum also intentionally maintains a process-local sessionless store.
 	NSArray<NSString *> *documentsURLs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
 	NSString *documentsPath = documentsURLs.firstObject;
 	if (documentsPath.length > 0) {
@@ -99,15 +98,12 @@ static NSString *zxFindForumMGParamsMap(void) {
 			stringByAppendingPathComponent:@"sessionless.data"]
 			stringByAppendingPathComponent:@"params_map.txt"] copy]);
 
-		// Compatibility with the AppGroup directory used by older sideload fixes.
 		zxAppendRuntimeMapCandidate(candidates, [[[[[documentsPath stringByAppendingPathComponent:@"AppGroup"]
 			stringByAppendingPathComponent:@"mobileconfig"]
 			stringByAppendingPathComponent:@"sessionless.data"]
 			stringByAppendingPathComponent:@"params_map.txt"] copy]);
 	}
 
-	// The IPA ships the same schema family under params_maps; this is a safe
-	// bootstrap only when no runtime MobileConfig map has been materialized yet.
 	zxAppendRuntimeMapCandidate(candidates, [[[[NSBundle mainBundle] bundlePath]
 		stringByAppendingPathComponent:@"params_maps"]
 		stringByAppendingPathComponent:@"params_map.txt"]);
@@ -127,7 +123,7 @@ static BOOL zxReadForumMGSchema(NSString **hashOut, NSArray<NSString *> **params
 	return zxParseV2ParamsMapAtPath(path, hashOut, paramsOut);
 }
 
-extern void objc_storeStrong(id *object, id value);
+typedef void (*ZXObjcStoreStrongFn)(void **slot, void *value);
 
 static BOOL zxSetStrongObjectIvar(id object, const char *name, id value) {
 	if (!object || !name) {
@@ -137,10 +133,21 @@ static BOOL zxSetStrongObjectIvar(id object, const char *name, id value) {
 	if (!ivar || ivar_getTypeEncoding(ivar)[0] != '@') {
 		return NO;
 	}
+
+	static ZXObjcStoreStrongFn storeStrong = NULL;
+	static dispatch_once_t onceToken;
+	dispatch_once(&onceToken, ^{
+		storeStrong = (ZXObjcStoreStrongFn)dlsym(RTLD_DEFAULT, "objc_storeStrong");
+	});
+	if (!storeStrong) {
+		return NO;
+	}
+
 	ptrdiff_t offset = ivar_getOffset(ivar);
 	uint8_t *base = (uint8_t *)(__bridge void *)object;
-	id __strong *slot = (id __strong *)(base + offset);
-	objc_storeStrong(slot, value);
+	void **slot = (void **)(base + offset);
+	void *rawValue = (__bridge void *)value;
+	storeStrong(slot, rawValue);
 	return YES;
 }
 
@@ -252,9 +259,6 @@ static void zxPopulateForumMGSchema(id controller) {
 }
 
 - (id)_cellForSchemaSection:(NSInteger)section forTableView:(id)tableView {
-	// Populate mg from the real MobileConfig v2 map immediately before Forum
-	// renders the schema cell. No executable text is modified and Forum's own
-	// schema-cell implementation still formats/displays the values.
 	zxPopulateForumMGSchema(self);
 	return %orig(section, tableView);
 }
