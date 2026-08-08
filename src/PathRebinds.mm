@@ -4,12 +4,18 @@
 #import <limits.h>
 #import <stdarg.h>
 #import <stdio.h>
+#import <stdlib.h>
 #import <string.h>
 #import <sys/stat.h>
 #import <unistd.h>
 
+#include <filesystem>
+#include <system_error>
+
 #import "Header.h"
 #import "../fishhook/fishhook.h"
+
+namespace fs = std::filesystem;
 
 static char gLegacyRootMobileConfig[PATH_MAX];
 static char gLegacyDocumentsMobileConfig[PATH_MAX];
@@ -27,6 +33,15 @@ static int (*orig_rmdir_fn)(const char *);
 static int (*orig_remove_fn)(const char *);
 static int (*orig_rename_fn)(const char *, const char *);
 static DIR *(*orig_opendir_fn)(const char *);
+
+// Forum's MobileConfig storage backend calls these libc++ filesystem entrypoints
+// directly. Rebinding only open/mkdir/NSFileManager is not sufficient because
+// libc++ can perform the underlying filesystem operation inside the shared cache.
+static fs::file_status (*orig_fs_status_fn)(const fs::path &, std::error_code *);
+static bool (*orig_fs_remove_fn)(const fs::path &, std::error_code *);
+static void (*orig_fs_rename_fn)(const fs::path &, const fs::path &, std::error_code *);
+static bool (*orig_fs_create_directories_fn)(const fs::path &, std::error_code *);
+static uintmax_t (*orig_fs_file_size_fn)(const fs::path &, std::error_code *);
 
 static BOOL pathMatchesPrefix(const char *path, const char *prefix) {
     if (!path || !prefix || !prefix[0]) {
@@ -65,6 +80,15 @@ static const char *rewriteMobileConfigPath(const char *path, int slot) {
     }
 
     return buffer;
+}
+
+static fs::path rewriteMobileConfigFilesystemPath(const fs::path &path, int slot) {
+    const std::string &native = path.native();
+    const char *rewritten = rewriteMobileConfigPath(native.c_str(), slot);
+    if (rewritten == native.c_str()) {
+        return path;
+    }
+    return fs::path(rewritten);
 }
 
 static int zx_open(const char *path, int oflag, ...) {
@@ -121,10 +145,40 @@ static DIR *zx_opendir(const char *path) {
     return orig_opendir_fn(rewriteMobileConfigPath(path, 0));
 }
 
+static fs::file_status zx_fs_status(const fs::path &path, std::error_code *error) {
+    fs::path rewritten = rewriteMobileConfigFilesystemPath(path, 0);
+    return orig_fs_status_fn(rewritten, error);
+}
+
+static bool zx_fs_remove(const fs::path &path, std::error_code *error) {
+    fs::path rewritten = rewriteMobileConfigFilesystemPath(path, 0);
+    return orig_fs_remove_fn(rewritten, error);
+}
+
+static void zx_fs_rename(const fs::path &oldPath, const fs::path &newPath, std::error_code *error) {
+    fs::path rewrittenOld = rewriteMobileConfigFilesystemPath(oldPath, 0);
+    fs::path rewrittenNew = rewriteMobileConfigFilesystemPath(newPath, 1);
+    orig_fs_rename_fn(rewrittenOld, rewrittenNew, error);
+}
+
+static bool zx_fs_create_directories(const fs::path &path, std::error_code *error) {
+    fs::path rewritten = rewriteMobileConfigFilesystemPath(path, 0);
+    return orig_fs_create_directories_fn(rewritten, error);
+}
+
+static uintmax_t zx_fs_file_size(const fs::path &path, std::error_code *error) {
+    fs::path rewritten = rewriteMobileConfigFilesystemPath(path, 0);
+    return orig_fs_file_size_fn(rewritten, error);
+}
+
 void rebindPathFuncs() {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        NSString *homePath = [NSHomeDirectory() stringByStandardizingPath];
+        const char *homeCString = getenv("HOME");
+        NSString *homePath = homeCString ? [NSString stringWithUTF8String:homeCString] : nil;
+        if (homePath.length == 0) {
+            homePath = NSHomeDirectory();
+        }
         NSString *documentsPath = [homePath stringByAppendingPathComponent:@"Documents"];
         NSString *canonicalPath = [[documentsPath stringByAppendingPathComponent:@"AppGroup"] stringByAppendingPathComponent:@"mobileconfig"];
 
@@ -145,6 +199,14 @@ void rebindPathFuncs() {
             {"remove", (void *)zx_remove, (void **)&orig_remove_fn},
             {"rename", (void *)zx_rename, (void **)&orig_rename_fn},
             {"opendir", (void *)zx_opendir, (void **)&orig_opendir_fn},
+
+            // Mach-O symbol names have one additional leading underscore;
+            // fishhook compares after stripping that prefix, so use _ZN... here.
+            {"_ZNSt3__14__fs10filesystem8__statusERKNS1_4pathEPNS_10error_codeE", (void *)zx_fs_status, (void **)&orig_fs_status_fn},
+            {"_ZNSt3__14__fs10filesystem8__removeERKNS1_4pathEPNS_10error_codeE", (void *)zx_fs_remove, (void **)&orig_fs_remove_fn},
+            {"_ZNSt3__14__fs10filesystem8__renameERKNS1_4pathES4_PNS_10error_codeE", (void *)zx_fs_rename, (void **)&orig_fs_rename_fn},
+            {"_ZNSt3__14__fs10filesystem20__create_directoriesERKNS1_4pathEPNS_10error_codeE", (void *)zx_fs_create_directories, (void **)&orig_fs_create_directories_fn},
+            {"_ZNSt3__14__fs10filesystem11__file_sizeERKNS1_4pathEPNS_10error_codeE", (void *)zx_fs_file_size, (void **)&orig_fs_file_size_fn},
         };
 
         rebind_symbols(bindings, sizeof(bindings) / sizeof(bindings[0]));
