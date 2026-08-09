@@ -3,31 +3,38 @@
 NSString *accessGroupId;
 NSString *bundleId;
 
-static void setRequiredIDs() {
+static void setRequiredIDs(void) {
 	NSDictionary *query = @{
 		(__bridge NSString *)kSecClass: (__bridge NSString *)kSecClassGenericPassword,
 		(__bridge NSString *)kSecAttrAccount: @"bundleSeedID",
 		(__bridge NSString *)kSecAttrService: @"",
 		(__bridge id)kSecReturnAttributes: (id)kCFBooleanTrue
 	};
-	
+
 	CFDictionaryRef result = nil;
 	OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef *)&result);
 	if (status == errSecItemNotFound) {
-		status = SecItemAdd((__bridge CFDictionaryRef)query, (CFTypeRef *)&result);
+		NSMutableDictionary *addQuery = [query mutableCopy];
+		addQuery[(__bridge NSString *)kSecAttrAccessible] = (__bridge NSString *)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
+		status = SecItemAdd((__bridge CFDictionaryRef)addQuery, (CFTypeRef *)&result);
+	} else if (status == errSecSuccess) {
+		NSDictionary *accessibleUpdate = @{
+			(__bridge NSString *)kSecAttrAccessible: (__bridge NSString *)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+		};
+		SecItemUpdate((__bridge CFDictionaryRef)@{
+			(__bridge NSString *)kSecClass: (__bridge NSString *)kSecClassGenericPassword,
+			(__bridge NSString *)kSecAttrAccount: @"bundleSeedID",
+			(__bridge NSString *)kSecAttrService: @""
+		}, (__bridge CFDictionaryRef)accessibleUpdate);
 	}
-	if (status != errSecSuccess) {
-		return;
-	}
-	
+	if (status != errSecSuccess || !result) return;
+
 	bundleId = [[NSBundle mainBundle] bundleIdentifier];
 	accessGroupId = [(__bridge NSDictionary *)result objectForKey:(__bridge NSString *)kSecAttrAccessGroup];
-	if (result) {
-		CFRelease(result);
-	}
+	CFRelease(result);
 }
 
-__attribute__((constructor)) static void init() {
+__attribute__((constructor)) static void init(void) {
 	setRequiredIDs();
 	rebindSecFuncs();
 }
