@@ -1,13 +1,7 @@
 #import <Foundation/Foundation.h>
-#import <mach-o/dyld.h>
-#import <mach-o/loader.h>
 #import <objc/runtime.h>
-
-#include <memory>
-#include <string>
-#include <unordered_map>
-#include <vector>
-#include <cstring>
+#import <stdlib.h>
+#import <string.h>
 
 #import "Header.h"
 
@@ -17,259 +11,173 @@
 
 @interface FBMobileConfigAdvancedSettingsViewController : NSObject
 - (NSString *)getParamsMapPath:(NSString *)resourceName;
-- (id)initWithSessionManager:(id)sessionManager
-          sessionlessManager:(id)sessionlessManager
-              adminIdManager:(id)adminIdManager
-              displayOptions:(id)displayOptions;
 @end
 
-static BOOL zxIsForumProcess(void) {
-	return [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.facebook.agora"];
-}
+@interface FBMobileConfigLifeCycleController : NSObject
++ (const char *)getParamsMapPath:(NSInteger)unitType enableV4Resource:(BOOL)enableV4Resource;
++ (const char *)getRNParamsMapPath:(NSInteger)unitType;
+@end
 
-static BOOL zxMainImageHasExpectedForumUUID(const struct mach_header_64 *header) {
-	if (!header || header->magic != MH_MAGIC_64) {
+static BOOL zxFileIsReadableAndNonEmpty(NSString *path) {
+	if (path.length == 0) {
 		return NO;
 	}
-
-	static const uint8_t expectedUUID[16] = {
-		0x4c, 0x4c, 0x44, 0x66, 0x55, 0x55, 0x31, 0x44,
-		0xa1, 0xaa, 0xd3, 0x35, 0x2a, 0xab, 0x60, 0x4c
-	};
-
-	const uint8_t *cursor = (const uint8_t *)(header + 1);
-	for (uint32_t index = 0; index < header->ncmds; index++) {
-		const struct load_command *command = (const struct load_command *)cursor;
-		if (command->cmdsize < sizeof(struct load_command)) {
-			return NO;
-		}
-		if (command->cmd == LC_UUID && command->cmdsize >= sizeof(struct uuid_command)) {
-			const struct uuid_command *uuidCommand = (const struct uuid_command *)command;
-			return memcmp(uuidCommand->uuid, expectedUUID, sizeof(expectedUUID)) == 0;
-		}
-		cursor += command->cmdsize;
-	}
-	return NO;
+	NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+	return [attrs[NSFileType] isEqualToString:NSFileTypeRegular] && [attrs[NSFileSize] unsignedLongLongValue] > 0;
 }
 
-static uint8_t *zxExpectedForumImageBase(void) {
-	if (!zxIsForumProcess() || ![[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] isEqual:@"1029615221"]) {
-		return NULL;
-	}
-
-	const struct mach_header *rawHeader = _dyld_get_image_header(0);
-	if (!rawHeader || rawHeader->magic != MH_MAGIC_64) {
-		return NULL;
-	}
-	const struct mach_header_64 *header = (const struct mach_header_64 *)rawHeader;
-	return zxMainImageHasExpectedForumUUID(header) ? (uint8_t *)header : NULL;
-}
-
-static BOOL zxWordsMatch(uint8_t *base, uintptr_t offset, const uint32_t expected[4]) {
-	if (!base) {
+static BOOL zxIsV2TextMap(NSString *path) {
+	if (!zxFileIsReadableAndNonEmpty(path)) {
 		return NO;
 	}
-	uint32_t actual[4] = {};
-	memcpy(actual, base + offset, sizeof(actual));
-	return memcmp(actual, expected, sizeof(actual)) == 0;
+	NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:path];
+	NSData *prefix = [handle readDataOfLength:3];
+	[handle closeFile];
+	if (prefix.length != 3) {
+		return NO;
+	}
+	const unsigned char *bytes = (const unsigned char *)prefix.bytes;
+	return bytes[0] == 'v' && bytes[1] == '2' && bytes[2] == ',';
 }
 
-static BOOL zxValidateForumMobileConfigABI(uint8_t *base) {
-	static const uint32_t parserWords[4] = {0xd10343ff, 0xa9095ff8, 0xa90a57f6, 0xa90b4ff4};
-	static const uint32_t sharedPtrMoveWords[4] = {0xd100c3ff, 0xa9014ff4, 0xa9027bfd, 0x910083fd};
-	static const uint32_t stringMoveWords[4] = {0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xaa0103f3};
-	static const uint32_t hashMergeWords[4] = {0xd10183ff, 0xa90357f6, 0xa9044ff4, 0xa9057bfd};
-	return zxWordsMatch(base, 0x268DA8, parserWords) &&
-		zxWordsMatch(base, 0x0E96A0, sharedPtrMoveWords) &&
-		zxWordsMatch(base, 0x0A82F4, stringMoveWords) &&
-		zxWordsMatch(base, 0x0E8210, hashMergeWords);
+static NSArray<NSString *> *zxBundleResourceDirectories(void) {
+	NSString *bundlePath = [NSBundle mainBundle].bundlePath;
+	if (bundlePath.length == 0) {
+		return @[];
+	}
+	return @[
+		[bundlePath stringByAppendingPathComponent:@"mobileconfig_res"],
+		[bundlePath stringByAppendingPathComponent:@"params_maps"],
+		bundlePath,
+	];
 }
 
-static BOOL zxIsV2ParamsMapText(NSString *contents) {
-	return contents.length > 3 && [contents hasPrefix:@"v2,"];
-}
-
-static void zxAppendCandidate(NSMutableArray<NSString *> *candidates, NSString *path) {
-	if (path.length > 0 && ![candidates containsObject:path]) {
-		[candidates addObject:path];
+static NSString *zxFindBundleResourceFile(NSString *fileName, BOOL requireV2Text) {
+	if (fileName.length == 0) {
+		return nil;
 	}
-}
-
-static void zxAppendMetadataCandidatesUnderContainer(NSMutableArray<NSString *> *candidates, NSURL *containerURL) {
-	if (!containerURL.isFileURL || containerURL.path.length == 0) {
-		return;
-	}
-
-	NSString *mobileConfigRoot = [containerURL.path stringByAppendingPathComponent:@"mobileconfig"];
-	NSArray<NSString *> *preferredNames = @[@"rn_params_map.txt", @"params_map.txt"];
-	for (NSString *name in preferredNames) {
-		zxAppendCandidate(candidates, [[mobileConfigRoot stringByAppendingPathComponent:@"sessionless.data"] stringByAppendingPathComponent:name]);
-	}
-
-	NSError *error = nil;
-	NSArray<NSString *> *children = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:mobileConfigRoot error:&error];
-	if (!children || error) {
-		return;
-	}
-	for (NSString *child in children) {
-		if (![child hasSuffix:@".data"] || [child isEqualToString:@"sessionless.data"]) {
-			continue;
-		}
-		for (NSString *name in preferredNames) {
-			zxAppendCandidate(candidates, [[mobileConfigRoot stringByAppendingPathComponent:child] stringByAppendingPathComponent:name]);
-		}
-	}
-}
-
-static NSString *zxFindForumMergeMetadataPath(void) {
-	NSMutableArray<NSString *> *candidates = [NSMutableArray array];
-
-	zxAppendMetadataCandidatesUnderContainer(candidates, sideloadFallbackAppGroupURL());
-
-	NSArray<NSString *> *documentsURLs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-	NSString *documentsPath = documentsURLs.firstObject;
-	if (documentsPath.length > 0) {
-		NSString *localRoot = [documentsPath stringByAppendingPathComponent:@"mobileconfig/sessionless.data"];
-		zxAppendCandidate(candidates, [localRoot stringByAppendingPathComponent:@"rn_params_map.txt"]);
-		zxAppendCandidate(candidates, [localRoot stringByAppendingPathComponent:@"params_map.txt"]);
-	}
-
-	NSURL *realGroup = preferredRealAppGroupURL();
-	if (realGroup && ![realGroup isEqual:sideloadFallbackAppGroupURL()]) {
-		zxAppendMetadataCandidatesUnderContainer(candidates, realGroup);
-	}
-
-	NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
-	zxAppendCandidate(candidates, [[bundlePath stringByAppendingPathComponent:@"mobileconfig_res"] stringByAppendingPathComponent:@"rn_params_map.txt"]);
-	zxAppendCandidate(candidates, [[bundlePath stringByAppendingPathComponent:@"params_maps"] stringByAppendingPathComponent:@"rn_params_map.txt"]);
-	zxAppendCandidate(candidates, [[bundlePath stringByAppendingPathComponent:@"params_maps"] stringByAppendingPathComponent:@"params_map.txt"]);
-
-	for (NSString *candidate in candidates) {
-		NSError *error = nil;
-		NSString *contents = [NSString stringWithContentsOfFile:candidate encoding:NSUTF8StringEncoding error:&error];
-		if (!error && zxIsV2ParamsMapText(contents)) {
+	for (NSString *directory in zxBundleResourceDirectories()) {
+		NSString *candidate = [directory stringByAppendingPathComponent:fileName];
+		BOOL valid = requireV2Text ? zxIsV2TextMap(candidate) : zxFileIsReadableAndNonEmpty(candidate);
+		if (valid) {
 			return candidate;
 		}
 	}
 	return nil;
 }
 
-using ZXUnitMap = std::unordered_map<int, int>;
-using ZXParsedMetaList = std::shared_ptr<const void>;
-using ZXMakeConfigMetaListWithMergeFn = ZXParsedMetaList (*)(int, const void *, int, const char *, ZXUnitMap &, std::string &, bool);
-using ZXSharedPtrMoveFn = void *(*)(void *, void *);
-using ZXStringMoveFn = void *(*)(void *, void *);
-using ZXHashMergeFn = std::string (*)(const std::string &, const std::string &);
+static void zxAppendRNMapCandidatesFromContainer(NSMutableArray<NSString *> *candidates, NSURL *containerURL) {
+	if (!containerURL.isFileURL || containerURL.path.length == 0) {
+		return;
+	}
+	NSString *root = [containerURL.path stringByAppendingPathComponent:@"mobileconfig"];
+	NSArray<NSString *> *children = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:root error:nil];
 
-static BOOL zxReadIndirectInt(uint8_t *base, uintptr_t globalOffset, int *valueOut) {
-	if (!base || !valueOut) {
-		return NO;
+	NSString *sessionless = [[root stringByAppendingPathComponent:@"sessionless.data"] stringByAppendingPathComponent:@"rn_params_map.txt"];
+	if (![candidates containsObject:sessionless]) {
+		[candidates addObject:sessionless];
 	}
-	uint8_t *holder = *(uint8_t **)(base + globalOffset);
-	if (!holder) {
-		return NO;
+	for (NSString *child in children ?: @[]) {
+		if (![child hasSuffix:@".data"] || [child isEqualToString:@"sessionless.data"]) {
+			continue;
+		}
+		NSString *candidate = [[root stringByAppendingPathComponent:child] stringByAppendingPathComponent:@"rn_params_map.txt"];
+		if (![candidates containsObject:candidate]) {
+			[candidates addObject:candidate];
+		}
 	}
-	*valueOut = *(int *)(holder + 8);
-	return YES;
 }
 
-static void zxPopulateForumMGSchemaWithOriginalParser(id controller) {
-	if (!controller) {
-		return;
+static NSString *zxFindRealRNParamsMap(void) {
+	// RN metadata is a distinct v2 map. Never substitute params_map.txt here:
+	// Facebook demonstrates that MG and PMAP can legitimately have different
+	// counts even when their hashes share the same base/delta pair.
+	NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+	NSString *bundleRN = zxFindBundleResourceFile(@"rn_params_map.txt", YES);
+	if (bundleRN) {
+		[candidates addObject:bundleRN];
 	}
 
-	uint8_t *base = zxExpectedForumImageBase();
-	if (!base || !zxValidateForumMobileConfigABI(base)) {
-		return;
+	zxAppendRNMapCandidatesFromContainer(candidates, preferredRealAppGroupURL());
+	zxAppendRNMapCandidatesFromContainer(candidates, sideloadFallbackAppGroupURL());
+
+	NSArray<NSString *> *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+	NSString *documentsPath = documents.firstObject;
+	if (documentsPath.length > 0) {
+		NSString *local = [[[documentsPath stringByAppendingPathComponent:@"mobileconfig"]
+			stringByAppendingPathComponent:@"sessionless.data"]
+			stringByAppendingPathComponent:@"rn_params_map.txt"];
+		if (![candidates containsObject:local]) {
+			[candidates addObject:local];
+		}
 	}
 
-	Ivar updatedHashIvar = class_getInstanceVariable([controller class], "updatedHash_");
-	Ivar updatedListIvar = class_getInstanceVariable([controller class], "updatedList_");
-	if (!updatedHashIvar || !updatedListIvar) {
-		return;
+	for (NSString *candidate in candidates) {
+		if (zxIsV2TextMap(candidate)) {
+			return candidate;
+		}
 	}
-	const char *hashEncoding = ivar_getTypeEncoding(updatedHashIvar);
-	const char *listEncoding = ivar_getTypeEncoding(updatedListIvar);
-	if (!hashEncoding || !listEncoding ||
-		!strstr(hashEncoding, "basic_string") || !strstr(listEncoding, "shared_ptr")) {
-		return;
+	return nil;
+}
+
+static const char *zxStableFileSystemRepresentation(NSString *path) {
+	if (path.length == 0) {
+		return NULL;
+	}
+	static NSMutableDictionary<NSString *, NSValue *> *cache = nil;
+	static dispatch_once_t onceToken;
+	dispatch_once(&onceToken, ^{
+		cache = [NSMutableDictionary dictionary];
+	});
+	@synchronized (cache) {
+		NSValue *existing = cache[path];
+		if (existing) {
+			return (const char *)existing.pointerValue;
+		}
+		const char *fs = path.fileSystemRepresentation;
+		if (!fs) {
+			return NULL;
+		}
+		char *copy = strdup(fs);
+		if (!copy) {
+			return NULL;
+		}
+		cache[path] = [NSValue valueWithPointer:copy];
+		return copy;
+	}
+}
+
+static BOOL zxCStringPathIsUsable(const char *path) {
+	if (!path || path[0] == '\0') {
+		return NO;
+	}
+	NSString *stringPath = [NSString stringWithUTF8String:path];
+	return zxFileIsReadableAndNonEmpty(stringPath);
+}
+
+static NSString *zxFindParamsMapFallback(NSInteger unitType, BOOL enableV4Resource) {
+	NSMutableArray<NSString *> *names = [NSMutableArray array];
+	if (enableV4Resource) {
+		if (unitType == 4) {
+			[names addObject:@"params_map_v4_u4.txt"];
+		} else {
+			[names addObject:@"params_map_v4_u0.txt"];
+			[names addObject:[NSString stringWithFormat:@"params_map_v4_u%ld.txt", (long)unitType]];
+		}
+	} else {
+		if (unitType == 4) {
+			[names addObject:@"params_map_kMobileConfigAdminId.txt"];
+		}
+		[names addObject:@"params_map.txt"];
 	}
 
-	uint8_t *objectBase = (uint8_t *)(__bridge void *)controller;
-	void *updatedListStorage = objectBase + ivar_getOffset(updatedListIvar);
-	void *updatedHashStorage = objectBase + ivar_getOffset(updatedHashIvar);
-	void **listWords = (void **)updatedListStorage;
-	if (listWords[0] != NULL) {
-		return;
+	for (NSString *name in names) {
+		NSString *candidate = zxFindBundleResourceFile(name, NO);
+		if (candidate) {
+			return candidate;
+		}
 	}
-
-	NSString *metadataPath = zxFindForumMergeMetadataPath();
-	if (metadataPath.length == 0) {
-		return;
-	}
-	NSError *readError = nil;
-	NSString *metadataText = [NSString stringWithContentsOfFile:metadataPath encoding:NSUTF8StringEncoding error:&readError];
-	if (readError || !zxIsV2ParamsMapText(metadataText)) {
-		return;
-	}
-	const char *metadataCString = [metadataText UTF8String];
-	if (!metadataCString) {
-		return;
-	}
-
-	uint8_t *schemaHolder = *(uint8_t **)(base + 0x3376BD0);
-	uint8_t *countHolder = *(uint8_t **)(base + 0x3376BC8);
-	uint8_t *nativeHashHolder = *(uint8_t **)(base + 0x33715C0);
-	if (!schemaHolder || !countHolder || !nativeHashHolder) {
-		return;
-	}
-	const void *compiledSchema = *(const void **)(schemaHolder + 0x10);
-	int compiledCount = *(int *)(countHolder + 8);
-	const char *nativeHashCString = *(const char **)(nativeHashHolder + 0x10);
-	if (!compiledSchema || compiledCount <= 0 || compiledCount > 100000 || !nativeHashCString || nativeHashCString[0] == '\0') {
-		return;
-	}
-
-	int unit1 = 0, unit2 = 0, unit3 = 0, unit4 = 0;
-	if (!zxReadIndirectInt(base, 0x3376BC0, &unit1) ||
-		!zxReadIndirectInt(base, 0x3376BB8, &unit2) ||
-		!zxReadIndirectInt(base, 0x3376BA8, &unit3) ||
-		!zxReadIndirectInt(base, 0x3376BB0, &unit4)) {
-		return;
-	}
-
-	ZXUnitMap unitMap;
-	unitMap.emplace(1, unit1);
-	unitMap.emplace(2, unit2);
-	unitMap.emplace(3, unit3);
-	unitMap.emplace(4, unit4);
-
-	auto makeConfigMetaList = (ZXMakeConfigMetaListWithMergeFn)(base + 0x268DA8);
-	auto moveSharedPtr = (ZXSharedPtrMoveFn)(base + 0x0E96A0);
-	auto moveString = (ZXStringMoveFn)(base + 0x0A82F4);
-	auto mergeHashes = (ZXHashMergeFn)(base + 0x0E8210);
-
-	std::string parsedHash;
-	ZXParsedMetaList parsedList = makeConfigMetaList(
-		2,
-		compiledSchema,
-		compiledCount,
-		metadataCString,
-		unitMap,
-		parsedHash,
-		false);
-	if (!parsedList || parsedHash.empty()) {
-		return;
-	}
-
-	std::string nativeHash(nativeHashCString);
-	std::string mergedHash = mergeHashes(nativeHash, parsedHash);
-	if (mergedHash.empty()) {
-		return;
-	}
-
-	moveSharedPtr(updatedListStorage, (void *)&parsedList);
-	moveString(updatedHashStorage, (void *)&mergedHash);
+	return nil;
 }
 
 %hook CKContainer
@@ -294,45 +202,32 @@ static void zxPopulateForumMGSchemaWithOriginalParser(id controller) {
 
 - (NSDictionary *)groupContainerURLs {
 	NSDictionary *containerURLs = %orig;
-	NSDictionary *mapped = mappedGroupContainerURLs(containerURLs);
-	if (!zxIsForumProcess() || ![mapped isKindOfClass:[NSDictionary class]]) {
-		return mapped;
-	}
-
-	NSURL *fallback = sideloadFallbackAppGroupURL();
-	if (!fallback) {
-		return mapped;
-	}
-	NSMutableDictionary *forumMapped = [mapped mutableCopy];
-	for (NSString *key in [mapped allKeys]) {
-		if (isMetaAppGroupIdentifier(key)) {
-			forumMapped[key] = fallback;
-		}
-	}
-	return [forumMapped copy];
+	return mappedGroupContainerURLs(containerURLs);
 }
 %end
 
 %hook NSFileManager
 - (NSURL *)containerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
-	if (zxIsForumProcess() && groupIdentifier != nil) {
-		return sideloadFallbackAppGroupURL();
-	}
-
 	NSURL *URL = %orig(groupIdentifier);
-	if (URL || !isMetaAppGroupIdentifier(groupIdentifier)) {
+	if (URL || groupIdentifier == nil) {
 		return URL;
 	}
-	URL = preferredRealAppGroupURL();
-	return URL ?: sideloadFallbackAppGroupURL();
+
+	// Preserve every group that the resigned process can genuinely resolve.
+	// Only failed entitlement lookups are remapped. This is universal and does
+	// not depend on a product bundle ID.
+	if (isMetaAppGroupIdentifier(groupIdentifier)) {
+		return preferredRealAppGroupURL() ?: sideloadFallbackAppGroupURL();
+	}
+
+	// Match the classic sideload AppGroup fix for otherwise-unavailable groups,
+	// while never overriding a successful OS-provided container above.
+	return sideloadFallbackAppGroupURL();
 }
 %end
 
 %hook METAAppGroup
 - (NSURL *)containerURL {
-	if (zxIsForumProcess()) {
-		return sideloadFallbackAppGroupURL();
-	}
 	NSURL *URL = %orig;
 	return URL ?: getAppGroupPathIfExists();
 }
@@ -340,11 +235,34 @@ static void zxPopulateForumMGSchemaWithOriginalParser(id controller) {
 
 %hook NSUserDefaults
 - (id)_initWithSuiteName:(NSString *)suiteName container:(NSURL *)container {
-	if (!isMetaAppGroupIdentifier(suiteName)) {
+	if (!isMetaAppGroupIdentifier(suiteName) || container != nil) {
 		return %orig(suiteName, container);
 	}
-	NSURL *mappedContainer = zxIsForumProcess() ? sideloadFallbackAppGroupURL() : preferredRealAppGroupURL();
-	return %orig(suiteName, mappedContainer ?: container);
+	NSURL *mappedContainer = preferredRealAppGroupURL() ?: sideloadFallbackAppGroupURL();
+	return %orig(suiteName, mappedContainer);
+}
+%end
+
+%hook NSBundle
+- (NSString *)pathForResource:(NSString *)name ofType:(NSString *)extension inDirectory:(NSString *)subpath {
+	NSString *path = %orig(name, extension, subpath);
+	if (path.length > 0 || ![subpath isEqualToString:@"mobileconfig_res"]) {
+		return path;
+	}
+
+	// Some repackaged Meta IPAs carry the same resources under params_maps.
+	// Alias only this exact missing resource directory; leave every other
+	// NSBundle lookup untouched.
+	NSString *fallback = %orig(name, extension, @"params_maps");
+	return fallback.length > 0 ? fallback : path;
+}
+
+- (NSURL *)URLForResource:(NSString *)name withExtension:(NSString *)extension subdirectory:(NSString *)subpath {
+	NSURL *URL = %orig(name, extension, subpath);
+	if (URL || ![subpath isEqualToString:@"mobileconfig_res"]) {
+		return URL;
+	}
+	return %orig(name, extension, @"params_maps");
 }
 %end
 
@@ -358,21 +276,25 @@ static void zxPopulateForumMGSchemaWithOriginalParser(id controller) {
 	NSString *fileName = resourceName.pathExtension.length > 0
 		? resourceName
 		: [resourceName stringByAppendingPathExtension:@"txt"];
-	NSString *candidate = [[[[NSBundle mainBundle] bundlePath]
-		stringByAppendingPathComponent:@"params_maps"]
-		stringByAppendingPathComponent:fileName];
-	return [[NSFileManager defaultManager] fileExistsAtPath:candidate] ? candidate : path;
+	return zxFindBundleResourceFile(fileName, NO);
+}
+%end
+
+%hook FBMobileConfigLifeCycleController
++ (const char *)getParamsMapPath:(NSInteger)unitType enableV4Resource:(BOOL)enableV4Resource {
+	const char *path = %orig(unitType, enableV4Resource);
+	if (zxCStringPathIsUsable(path)) {
+		return path;
+	}
+	return zxStableFileSystemRepresentation(zxFindParamsMapFallback(unitType, enableV4Resource));
 }
 
-- (id)initWithSessionManager:(id)sessionManager
-          sessionlessManager:(id)sessionlessManager
-              adminIdManager:(id)adminIdManager
-              displayOptions:(id)displayOptions {
-	id result = %orig(sessionManager, sessionlessManager, adminIdManager, displayOptions);
-	if (result) {
-		zxPopulateForumMGSchemaWithOriginalParser(result);
++ (const char *)getRNParamsMapPath:(NSInteger)unitType {
+	const char *path = %orig(unitType);
+	if (zxCStringPathIsUsable(path)) {
+		return path;
 	}
-	return result;
+	return zxStableFileSystemRepresentation(zxFindRealRNParamsMap());
 }
 %end
 
