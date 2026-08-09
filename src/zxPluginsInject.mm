@@ -3,35 +3,57 @@
 NSString *accessGroupId;
 NSString *bundleId;
 
-static void setRequiredIDs(void) {
-	NSDictionary *query = @{
+static NSString *ensureKeychainMarker(NSString *account, BOOL normalizeAccessibility) {
+	if (account.length == 0) {
+		return nil;
+	}
+
+	NSDictionary *baseQuery = @{
 		(__bridge NSString *)kSecClass: (__bridge NSString *)kSecClassGenericPassword,
-		(__bridge NSString *)kSecAttrAccount: @"bundleSeedID",
-		(__bridge NSString *)kSecAttrService: @"",
-		(__bridge id)kSecReturnAttributes: (id)kCFBooleanTrue
+		(__bridge NSString *)kSecAttrAccount: account,
+		(__bridge NSString *)kSecAttrService: @""
 	};
+	NSMutableDictionary *readQuery = [baseQuery mutableCopy];
+	readQuery[(__bridge NSString *)kSecReturnAttributes] = (id)kCFBooleanTrue;
 
 	CFDictionaryRef result = nil;
-	OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef *)&result);
+	OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)readQuery, (CFTypeRef *)&result);
 	if (status == errSecItemNotFound) {
-		NSMutableDictionary *addQuery = [query mutableCopy];
-		addQuery[(__bridge NSString *)kSecAttrAccessible] = (__bridge NSString *)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
+		NSMutableDictionary *addQuery = [readQuery mutableCopy];
+		if (normalizeAccessibility) {
+			addQuery[(__bridge NSString *)kSecAttrAccessible] = (__bridge NSString *)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
+		}
 		status = SecItemAdd((__bridge CFDictionaryRef)addQuery, (CFTypeRef *)&result);
-	} else if (status == errSecSuccess) {
+	} else if (status == errSecSuccess && normalizeAccessibility) {
 		NSDictionary *accessibleUpdate = @{
 			(__bridge NSString *)kSecAttrAccessible: (__bridge NSString *)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
 		};
-		SecItemUpdate((__bridge CFDictionaryRef)@{
-			(__bridge NSString *)kSecClass: (__bridge NSString *)kSecClassGenericPassword,
-			(__bridge NSString *)kSecAttrAccount: @"bundleSeedID",
-			(__bridge NSString *)kSecAttrService: @""
-		}, (__bridge CFDictionaryRef)accessibleUpdate);
+		SecItemUpdate((__bridge CFDictionaryRef)baseQuery, (__bridge CFDictionaryRef)accessibleUpdate);
 	}
-	if (status != errSecSuccess || !result) return;
+
+	if (status != errSecSuccess || !result) {
+		if (result) {
+			CFRelease(result);
+		}
+		return nil;
+	}
+
+	NSString *group = [(__bridge NSDictionary *)result objectForKey:(__bridge NSString *)kSecAttrAccessGroup];
+	NSString *copiedGroup = [group copy];
+	CFRelease(result);
+	return copiedGroup;
+}
+
+static void setRequiredIDs(void) {
+	// SideloadKeychainFix marker.
+	NSString *bundleSeedGroup = ensureKeychainMarker(@"bundleSeedID", NO);
+
+	// zxPluginsInject / magic marker. magic additionally normalizes this item's
+	// accessibility to AfterFirstUnlockThisDeviceOnly.
+	NSString *genericGroup = ensureKeychainMarker(@"zxPluginsInjectGenericEntry", YES);
 
 	bundleId = [[NSBundle mainBundle] bundleIdentifier];
-	accessGroupId = [(__bridge NSDictionary *)result objectForKey:(__bridge NSString *)kSecAttrAccessGroup];
-	CFRelease(result);
+	accessGroupId = bundleSeedGroup ?: genericGroup;
 }
 
 __attribute__((constructor)) static void init(void) {
