@@ -112,6 +112,8 @@ static NSArray<NSString *> *normalizedSignedGroups(NSDictionary *entitlements) {
 static NSArray<NSString *> *orderedCandidateGroups(NSArray<NSString *> *signedGroups, NSDictionary *entitlements) {
 	NSMutableArray<NSString *> *ordered = [NSMutableArray array];
 
+	// Prefer a group derived from the *current* signed application identifier.
+	// There are deliberately no product/bundle-specific group names here.
 	NSString *applicationIdentifier = entitlements[@"application-identifier"];
 	if ([applicationIdentifier isKindOfClass:[NSString class]]) {
 		NSRange separator = [applicationIdentifier rangeOfString:@"."];
@@ -124,11 +126,6 @@ static NSArray<NSString *> *orderedCandidateGroups(NSArray<NSString *> *signedGr
 		}
 	}
 
-	for (NSString *candidate in @[@"group.ryuk2.anoxclan.com", @"group.com.anoxclan.ryuk"]) {
-		if ([signedGroups containsObject:candidate] && ![ordered containsObject:candidate]) {
-			[ordered addObject:candidate];
-		}
-	}
 	for (NSString *candidate in signedGroups) {
 		if (![ordered containsObject:candidate]) {
 			[ordered addObject:candidate];
@@ -142,10 +139,8 @@ void initializeAppGroupMapping(void) {
 		NSDictionary *proxyContainerURLs = nil;
 		NSDictionary *proxyEntitlements = bundleProxyEntitlements(&proxyContainerURLs);
 		NSDictionary *signedEntitlements = taskEntitlements();
-
-		// SecTask reflects the process' actual code-signing entitlements and does
-		// not depend on LSBundleProxy being initialized yet. Prefer it at startup.
 		NSDictionary *entitlements = signedEntitlements ?: proxyEntitlements ?: @{};
+
 		gOriginalEntitlements = [entitlements copy];
 		gOriginalGroupContainerURLs = [proxyContainerURLs copy] ?: @{};
 		gSignedApplicationGroups = normalizedSignedGroups(gOriginalEntitlements);
@@ -154,8 +149,8 @@ void initializeAppGroupMapping(void) {
 		for (NSString *groupIdentifier in orderedCandidateGroups(gSignedApplicationGroups, gOriginalEntitlements)) {
 			NSURL *URL = URLFromGroupContainerValue(gOriginalGroupContainerURLs[groupIdentifier]);
 			if (!URL) {
-				// This runs before %init, so this is Foundation's genuine entitlement
-				// check for an identifier that is actually present in the signature.
+				// Runs before the Logos hooks are installed, so this is the genuine
+				// entitlement lookup for a group actually present in the signature.
 				URL = [fileManager containerURLForSecurityApplicationGroupIdentifier:groupIdentifier];
 			}
 			if (URL) {
@@ -196,38 +191,6 @@ BOOL isMetaAppGroupIdentifier(NSString *groupIdentifier) {
 		[groupIdentifier hasPrefix:@"group.net.whatsapp."];
 }
 
-NSDictionary *mappedApplicationGroupEntitlements(NSDictionary *entitlements) {
-	initializeAppGroupMapping();
-	if (!gPreferredRealAppGroupURL || ![entitlements isKindOfClass:[NSDictionary class]]) {
-		return entitlements;
-	}
-
-	NSMutableDictionary *mapped = [entitlements mutableCopy];
-	NSMutableArray<NSString *> *groups = [NSMutableArray arrayWithArray:normalizedSignedGroups(entitlements)];
-	for (NSString *alias in knownMetaAppGroupIdentifiers()) {
-		if (![groups containsObject:alias]) {
-			[groups addObject:alias];
-		}
-	}
-	mapped[@"com.apple.security.application-groups"] = [groups copy];
-	return [mapped copy];
-}
-
-NSDictionary *mappedGroupContainerURLs(NSDictionary *groupContainerURLs) {
-	initializeAppGroupMapping();
-	if (!gPreferredRealAppGroupURL) {
-		return groupContainerURLs;
-	}
-
-	NSMutableDictionary *mapped = [groupContainerURLs isKindOfClass:[NSDictionary class]]
-		? [groupContainerURLs mutableCopy]
-		: [NSMutableDictionary dictionary];
-	for (NSString *alias in knownMetaAppGroupIdentifiers()) {
-		mapped[alias] = gPreferredRealAppGroupURL;
-	}
-	return [mapped copy];
-}
-
 static NSString *homeDirectoryPath(void) {
 	const char *homeCString = getenv("HOME");
 	NSString *home = homeCString ? [NSString stringWithUTF8String:homeCString] : nil;
@@ -255,7 +218,52 @@ NSURL *sideloadFallbackAppGroupURL(void) {
 	return [NSURL fileURLWithPath:appGroupPath isDirectory:YES];
 }
 
-NSURL *getAppGroupPathIfExists(void) {
+static NSURL *aliasTargetURL(void) {
+	// A real group common to the resigned app/extensions is preferred. If the
+	// signature has no usable group, emulate the missing entitlement in the
+	// containing process exactly where classic sideload fixes do it.
 	NSURL *realURL = preferredRealAppGroupURL();
 	return realURL ?: sideloadFallbackAppGroupURL();
+}
+
+NSDictionary *mappedApplicationGroupEntitlements(NSDictionary *entitlements) {
+	if (![entitlements isKindOfClass:[NSDictionary class]]) {
+		return entitlements;
+	}
+
+	// Do not require LSBundleProxy/SecTask to have found a real group before
+	// exposing the original Meta aliases. Code often checks entitlements before
+	// it ever asks NSFileManager for the URL.
+	NSMutableDictionary *mapped = [entitlements mutableCopy];
+	NSMutableArray<NSString *> *groups = [NSMutableArray arrayWithArray:normalizedSignedGroups(entitlements)];
+	for (NSString *alias in knownMetaAppGroupIdentifiers()) {
+		if (![groups containsObject:alias]) {
+			[groups addObject:alias];
+		}
+	}
+	mapped[@"com.apple.security.application-groups"] = [groups copy];
+	return [mapped copy];
+}
+
+NSDictionary *mappedGroupContainerURLs(NSDictionary *groupContainerURLs) {
+	NSMutableDictionary *mapped = [groupContainerURLs isKindOfClass:[NSDictionary class]]
+		? [groupContainerURLs mutableCopy]
+		: [NSMutableDictionary dictionary];
+	NSURL *target = aliasTargetURL();
+	if (!target) {
+		return [mapped copy];
+	}
+
+	// Preserve every real container returned by the OS. Only synthesize aliases
+	// that are missing from the resigned process.
+	for (NSString *alias in knownMetaAppGroupIdentifiers()) {
+		if (mapped[alias] == nil) {
+			mapped[alias] = target;
+		}
+	}
+	return [mapped copy];
+}
+
+NSURL *getAppGroupPathIfExists(void) {
+	return aliasTargetURL();
 }
