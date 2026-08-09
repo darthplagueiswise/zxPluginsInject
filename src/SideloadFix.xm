@@ -1,184 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <stdlib.h>
-#import <string.h>
-
 #import "Header.h"
-
-@interface METAAppGroup : NSObject
-- (NSURL *)containerURL;
-@end
-
-@interface FBMobileConfigAdvancedSettingsViewController : NSObject
-- (NSString *)getParamsMapPath:(NSString *)resourceName;
-@end
-
-@interface FBMobileConfigLifeCycleController : NSObject
-+ (const char *)getParamsMapPath:(NSInteger)unitType enableV4Resource:(BOOL)enableV4Resource;
-+ (const char *)getRNParamsMapPath:(NSInteger)unitType;
-@end
-
-static BOOL zxFileIsReadableAndNonEmpty(NSString *path) {
-	if (path.length == 0) {
-		return NO;
-	}
-	NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-	return [attrs[NSFileType] isEqualToString:NSFileTypeRegular] && [attrs[NSFileSize] unsignedLongLongValue] > 0;
-}
-
-static BOOL zxIsV2TextMap(NSString *path) {
-	if (!zxFileIsReadableAndNonEmpty(path)) {
-		return NO;
-	}
-	NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:path];
-	NSData *prefix = [handle readDataOfLength:3];
-	[handle closeFile];
-	if (prefix.length != 3) {
-		return NO;
-	}
-	const unsigned char *bytes = (const unsigned char *)prefix.bytes;
-	return bytes[0] == 'v' && bytes[1] == '2' && bytes[2] == ',';
-}
-
-static NSArray<NSString *> *zxBundleResourceDirectories(void) {
-	NSString *bundlePath = [NSBundle mainBundle].bundlePath;
-	if (bundlePath.length == 0) {
-		return @[];
-	}
-	return @[
-		[bundlePath stringByAppendingPathComponent:@"mobileconfig_res"],
-		[bundlePath stringByAppendingPathComponent:@"params_maps"],
-		bundlePath,
-	];
-}
-
-static NSString *zxFindBundleResourceFile(NSString *fileName, BOOL requireV2Text) {
-	if (fileName.length == 0) {
-		return nil;
-	}
-	for (NSString *directory in zxBundleResourceDirectories()) {
-		NSString *candidate = [directory stringByAppendingPathComponent:fileName];
-		BOOL valid = requireV2Text ? zxIsV2TextMap(candidate) : zxFileIsReadableAndNonEmpty(candidate);
-		if (valid) {
-			return candidate;
-		}
-	}
-	return nil;
-}
-
-static void zxAppendRNMapCandidatesFromContainer(NSMutableArray<NSString *> *candidates, NSURL *containerURL) {
-	if (!containerURL.isFileURL || containerURL.path.length == 0) {
-		return;
-	}
-	NSString *root = [containerURL.path stringByAppendingPathComponent:@"mobileconfig"];
-	NSArray<NSString *> *children = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:root error:nil];
-
-	NSString *sessionless = [[root stringByAppendingPathComponent:@"sessionless.data"] stringByAppendingPathComponent:@"rn_params_map.txt"];
-	if (![candidates containsObject:sessionless]) {
-		[candidates addObject:sessionless];
-	}
-	for (NSString *child in children ?: @[]) {
-		if (![child hasSuffix:@".data"] || [child isEqualToString:@"sessionless.data"]) {
-			continue;
-		}
-		NSString *candidate = [[root stringByAppendingPathComponent:child] stringByAppendingPathComponent:@"rn_params_map.txt"];
-		if (![candidates containsObject:candidate]) {
-			[candidates addObject:candidate];
-		}
-	}
-}
-
-static NSString *zxFindRealRNParamsMap(void) {
-	// RN metadata is a distinct v2 map. Never substitute params_map.txt here:
-	// Facebook demonstrates that MG and PMAP can legitimately have different
-	// counts even when their hashes share the same base/delta pair.
-	NSMutableArray<NSString *> *candidates = [NSMutableArray array];
-	NSString *bundleRN = zxFindBundleResourceFile(@"rn_params_map.txt", YES);
-	if (bundleRN) {
-		[candidates addObject:bundleRN];
-	}
-
-	zxAppendRNMapCandidatesFromContainer(candidates, preferredRealAppGroupURL());
-	zxAppendRNMapCandidatesFromContainer(candidates, sideloadFallbackAppGroupURL());
-
-	NSArray<NSString *> *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-	NSString *documentsPath = documents.firstObject;
-	if (documentsPath.length > 0) {
-		NSString *local = [[[documentsPath stringByAppendingPathComponent:@"mobileconfig"]
-			stringByAppendingPathComponent:@"sessionless.data"]
-			stringByAppendingPathComponent:@"rn_params_map.txt"];
-		if (![candidates containsObject:local]) {
-			[candidates addObject:local];
-		}
-	}
-
-	for (NSString *candidate in candidates) {
-		if (zxIsV2TextMap(candidate)) {
-			return candidate;
-		}
-	}
-	return nil;
-}
-
-static const char *zxStableFileSystemRepresentation(NSString *path) {
-	if (path.length == 0) {
-		return NULL;
-	}
-	static NSMutableDictionary<NSString *, NSValue *> *cache = nil;
-	static dispatch_once_t onceToken;
-	dispatch_once(&onceToken, ^{
-		cache = [NSMutableDictionary dictionary];
-	});
-	@synchronized (cache) {
-		NSValue *existing = cache[path];
-		if (existing) {
-			return (const char *)existing.pointerValue;
-		}
-		const char *fs = path.fileSystemRepresentation;
-		if (!fs) {
-			return NULL;
-		}
-		char *copy = strdup(fs);
-		if (!copy) {
-			return NULL;
-		}
-		cache[path] = [NSValue valueWithPointer:copy];
-		return copy;
-	}
-}
-
-static BOOL zxCStringPathIsUsable(const char *path) {
-	if (!path || path[0] == '\0') {
-		return NO;
-	}
-	NSString *stringPath = [NSString stringWithUTF8String:path];
-	return zxFileIsReadableAndNonEmpty(stringPath);
-}
-
-static NSString *zxFindParamsMapFallback(NSInteger unitType, BOOL enableV4Resource) {
-	NSMutableArray<NSString *> *names = [NSMutableArray array];
-	if (enableV4Resource) {
-		if (unitType == 4) {
-			[names addObject:@"params_map_v4_u4.txt"];
-		} else {
-			[names addObject:@"params_map_v4_u0.txt"];
-			[names addObject:[NSString stringWithFormat:@"params_map_v4_u%ld.txt", (long)unitType]];
-		}
-	} else {
-		if (unitType == 4) {
-			[names addObject:@"params_map_kMobileConfigAdminId.txt"];
-		}
-		[names addObject:@"params_map.txt"];
-	}
-
-	for (NSString *name in names) {
-		NSString *candidate = zxFindBundleResourceFile(name, NO);
-		if (candidate) {
-			return candidate;
-		}
-	}
-	return nil;
-}
 
 %hook CKContainer
 - (id)_setupWithContainerID:(id)a options:(id)b { return nil; }
@@ -187,118 +9,112 @@ static NSString *zxFindParamsMapFallback(NSInteger unitType, BOOL enableV4Resour
 
 %hook CKEntitlements
 - (id)initWithEntitlementsDict:(NSDictionary *)entitlements {
-	NSMutableDictionary *mutEntitlements = [entitlements mutableCopy];
-	[mutEntitlements removeObjectForKey:@"com.apple.developer.icloud-container-environment"];
-	[mutEntitlements removeObjectForKey:@"com.apple.developer.icloud-services"];
-	return %orig([mutEntitlements copy]);
-}
-%end
-
-%hook LSBundleProxy
-- (NSDictionary *)entitlements {
-	NSDictionary *entitlements = %orig;
-	return mappedApplicationGroupEntitlements(entitlements);
-}
-
-- (NSDictionary *)groupContainerURLs {
-	NSDictionary *containerURLs = %orig;
-	return mappedGroupContainerURLs(containerURLs);
+	NSMutableDictionary *mutableEntitlements = [entitlements mutableCopy];
+	[mutableEntitlements removeObjectForKey:@"com.apple.developer.icloud-container-environment"];
+	[mutableEntitlements removeObjectForKey:@"com.apple.developer.icloud-services"];
+	return %orig([mutableEntitlements copy]);
 }
 %end
 
 %hook NSFileManager
 - (NSURL *)containerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
-	NSURL *URL = %orig(groupIdentifier);
-	if (URL || groupIdentifier == nil) {
-		return URL;
+	// Exact behavior of the supplied SideloadKeychainFix: every non-nil App Group
+	// resolves to one deterministic sandbox-backed AppGroup directory.
+	if (groupIdentifier != nil) {
+		NSURL *fallback = getAppGroupPathIfExists();
+		if (fallback) return fallback;
 	}
-
-	// Preserve every group that the resigned process can genuinely resolve.
-	// Only failed entitlement lookups are remapped. This is universal and does
-	// not depend on a product bundle ID.
-	if (isMetaAppGroupIdentifier(groupIdentifier)) {
-		return preferredRealAppGroupURL() ?: sideloadFallbackAppGroupURL();
-	}
-
-	// Match the classic sideload AppGroup fix for otherwise-unavailable groups,
-	// while never overriding a successful OS-provided container above.
-	return sideloadFallbackAppGroupURL();
+	return %orig(groupIdentifier);
 }
+
+- (BOOL)fileExistsAtPath:(NSString *)path { return %orig(canonicalizedSideloadPath(path)); }
+- (BOOL)fileExistsAtPath:(NSString *)path isDirectory:(BOOL *)isDirectory { return %orig(canonicalizedSideloadPath(path), isDirectory); }
+- (BOOL)createDirectoryAtPath:(NSString *)path withIntermediateDirectories:(BOOL)createIntermediates attributes:(NSDictionary *)attributes error:(NSError **)error { return %orig(canonicalizedSideloadPath(path), createIntermediates, attributes, error); }
+- (BOOL)createFileAtPath:(NSString *)path contents:(NSData *)data attributes:(NSDictionary *)attributes { return %orig(canonicalizedSideloadPath(path), data, attributes); }
+- (NSData *)contentsAtPath:(NSString *)path { return %orig(canonicalizedSideloadPath(path)); }
+- (NSArray<NSString *> *)contentsOfDirectoryAtPath:(NSString *)path error:(NSError **)error { return %orig(canonicalizedSideloadPath(path), error); }
+- (NSDictionary *)attributesOfItemAtPath:(NSString *)path error:(NSError **)error { return %orig(canonicalizedSideloadPath(path), error); }
+- (BOOL)removeItemAtPath:(NSString *)path error:(NSError **)error { return %orig(canonicalizedSideloadPath(path), error); }
+- (BOOL)copyItemAtPath:(NSString *)srcPath toPath:(NSString *)dstPath error:(NSError **)error { return %orig(canonicalizedSideloadPath(srcPath), canonicalizedSideloadPath(dstPath), error); }
+- (BOOL)moveItemAtPath:(NSString *)srcPath toPath:(NSString *)dstPath error:(NSError **)error { return %orig(canonicalizedSideloadPath(srcPath), canonicalizedSideloadPath(dstPath), error); }
+- (BOOL)createDirectoryAtURL:(NSURL *)url withIntermediateDirectories:(BOOL)createIntermediates attributes:(NSDictionary *)attributes error:(NSError **)error { return %orig(canonicalizedSideloadURL(url), createIntermediates, attributes, error); }
+- (BOOL)removeItemAtURL:(NSURL *)url error:(NSError **)error { return %orig(canonicalizedSideloadURL(url), error); }
+- (BOOL)copyItemAtURL:(NSURL *)srcURL toURL:(NSURL *)dstURL error:(NSError **)error { return %orig(canonicalizedSideloadURL(srcURL), canonicalizedSideloadURL(dstURL), error); }
+- (BOOL)moveItemAtURL:(NSURL *)srcURL toURL:(NSURL *)dstURL error:(NSError **)error { return %orig(canonicalizedSideloadURL(srcURL), canonicalizedSideloadURL(dstURL), error); }
+- (NSArray<NSURL *> *)contentsOfDirectoryAtURL:(NSURL *)url includingPropertiesForKeys:(NSArray<NSURLResourceKey> *)keys options:(NSDirectoryEnumerationOptions)mask error:(NSError **)error { return %orig(canonicalizedSideloadURL(url), keys, mask, error); }
 %end
 
-%hook METAAppGroup
-- (NSURL *)containerURL {
-	NSURL *URL = %orig;
-	return URL ?: getAppGroupPathIfExists();
+static const void *kZXSuiteNameKey = &kZXSuiteNameKey;
+static const void *kZXMirrorDefaultsKey = &kZXMirrorDefaultsKey;
+static __thread BOOL gZXDefaultsFanout = NO;
+
+static BOOL zxIsGroupSuite(NSString *suiteName) {
+	return [suiteName isKindOfClass:[NSString class]] && [suiteName hasPrefix:@"group"];
 }
-%end
+
+static NSUserDefaults *zxMirrorDefaults(NSUserDefaults *defaults) {
+	if (!defaults || gZXDefaultsFanout) return nil;
+	NSString *suiteName = objc_getAssociatedObject(defaults, kZXSuiteNameKey);
+	if (!zxIsGroupSuite(suiteName)) return nil;
+	NSUserDefaults *mirror = objc_getAssociatedObject(defaults, kZXMirrorDefaultsKey);
+	if (mirror) return mirror;
+	NSURL *container = getAppGroupPathIfExists();
+	if (!container) return nil;
+	gZXDefaultsFanout = YES;
+	SEL privateInit = NSSelectorFromString(@"_initWithSuiteName:container:");
+	if ([[NSUserDefaults alloc] respondsToSelector:privateInit]) {
+		id allocated = [NSUserDefaults alloc];
+		mirror = ((id (*)(id, SEL, NSString *, NSURL *))objc_msgSend)(allocated, privateInit, suiteName, container);
+	}
+	gZXDefaultsFanout = NO;
+	if (mirror && mirror != defaults) objc_setAssociatedObject(defaults, kZXMirrorDefaultsKey, mirror, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+	return mirror == defaults ? nil : mirror;
+}
 
 %hook NSUserDefaults
+- (id)initWithSuiteName:(NSString *)suiteName {
+	id result = %orig(suiteName);
+	if (result && zxIsGroupSuite(suiteName)) objc_setAssociatedObject(result, kZXSuiteNameKey, suiteName, OBJC_ASSOCIATION_COPY_NONATOMIC);
+	return result;
+}
+
 - (id)_initWithSuiteName:(NSString *)suiteName container:(NSURL *)container {
-	if (!isMetaAppGroupIdentifier(suiteName) || container != nil) {
-		return %orig(suiteName, container);
-	}
-	NSURL *mappedContainer = preferredRealAppGroupURL() ?: sideloadFallbackAppGroupURL();
-	return %orig(suiteName, mappedContainer);
-}
-%end
-
-%hook NSBundle
-- (NSString *)pathForResource:(NSString *)name ofType:(NSString *)extension inDirectory:(NSString *)subpath {
-	NSString *path = %orig(name, extension, subpath);
-	if (path.length > 0 || ![subpath isEqualToString:@"mobileconfig_res"]) {
-		return path;
-	}
-
-	// Some repackaged Meta IPAs carry the same resources under params_maps.
-	// Alias only this exact missing resource directory; leave every other
-	// NSBundle lookup untouched.
-	NSString *fallback = %orig(name, extension, @"params_maps");
-	return fallback.length > 0 ? fallback : path;
+	if (gZXDefaultsFanout || !zxIsGroupSuite(suiteName)) return %orig(suiteName, container);
+	NSURL *mapped = getAppGroupPathIfExists();
+	id result = %orig(suiteName, mapped ?: container);
+	if (result) objc_setAssociatedObject(result, kZXSuiteNameKey, suiteName, OBJC_ASSOCIATION_COPY_NONATOMIC);
+	return result;
 }
 
-- (NSURL *)URLForResource:(NSString *)name withExtension:(NSString *)extension subdirectory:(NSString *)subpath {
-	NSURL *URL = %orig(name, extension, subpath);
-	if (URL || ![subpath isEqualToString:@"mobileconfig_res"]) {
-		return URL;
-	}
-	return %orig(name, extension, @"params_maps");
-}
-%end
-
-%hook FBMobileConfigAdvancedSettingsViewController
-- (NSString *)getParamsMapPath:(NSString *)resourceName {
-	NSString *path = %orig(resourceName);
-	if (path.length > 0 || resourceName.length == 0) {
-		return path;
-	}
-
-	NSString *fileName = resourceName.pathExtension.length > 0
-		? resourceName
-		: [resourceName stringByAppendingPathExtension:@"txt"];
-	return zxFindBundleResourceFile(fileName, NO);
-}
-%end
-
-%hook FBMobileConfigLifeCycleController
-+ (const char *)getParamsMapPath:(NSInteger)unitType enableV4Resource:(BOOL)enableV4Resource {
-	const char *path = %orig(unitType, enableV4Resource);
-	if (zxCStringPathIsUsable(path)) {
-		return path;
-	}
-	return zxStableFileSystemRepresentation(zxFindParamsMapFallback(unitType, enableV4Resource));
+- (id)objectForKey:(NSString *)key {
+	id value = %orig(key);
+	if (value || gZXDefaultsFanout) return value;
+	NSUserDefaults *mirror = zxMirrorDefaults(self);
+	if (!mirror) return value;
+	gZXDefaultsFanout = YES;
+	id mirrored = [mirror objectForKey:key];
+	gZXDefaultsFanout = NO;
+	return mirrored;
 }
 
-+ (const char *)getRNParamsMapPath:(NSInteger)unitType {
-	const char *path = %orig(unitType);
-	if (zxCStringPathIsUsable(path)) {
-		return path;
-	}
-	return zxStableFileSystemRepresentation(zxFindRealRNParamsMap());
+- (void)setObject:(id)value forKey:(NSString *)key {
+	%orig(value, key);
+	if (gZXDefaultsFanout) return;
+	NSUserDefaults *mirror = zxMirrorDefaults(self); if (!mirror) return;
+	gZXDefaultsFanout = YES; [mirror setObject:value forKey:key]; gZXDefaultsFanout = NO;
 }
+- (void)setBool:(BOOL)value forKey:(NSString *)key { %orig(value,key); if (!gZXDefaultsFanout) { NSUserDefaults *m=zxMirrorDefaults(self); if(m){gZXDefaultsFanout=YES;[m setBool:value forKey:key];gZXDefaultsFanout=NO;} } }
+- (void)setInteger:(NSInteger)value forKey:(NSString *)key { %orig(value,key); if (!gZXDefaultsFanout) { NSUserDefaults *m=zxMirrorDefaults(self); if(m){gZXDefaultsFanout=YES;[m setInteger:value forKey:key];gZXDefaultsFanout=NO;} } }
+- (void)setDouble:(double)value forKey:(NSString *)key { %orig(value,key); if (!gZXDefaultsFanout) { NSUserDefaults *m=zxMirrorDefaults(self); if(m){gZXDefaultsFanout=YES;[m setDouble:value forKey:key];gZXDefaultsFanout=NO;} } }
+- (void)setFloat:(float)value forKey:(NSString *)key { %orig(value,key); if (!gZXDefaultsFanout) { NSUserDefaults *m=zxMirrorDefaults(self); if(m){gZXDefaultsFanout=YES;[m setFloat:value forKey:key];gZXDefaultsFanout=NO;} } }
+- (void)setURL:(NSURL *)url forKey:(NSString *)key { %orig(url,key); if (!gZXDefaultsFanout) { NSUserDefaults *m=zxMirrorDefaults(self); if(m){gZXDefaultsFanout=YES;[m setURL:url forKey:key];gZXDefaultsFanout=NO;} } }
+- (void)setValue:(id)value forKey:(NSString *)key { %orig(value,key); if (!gZXDefaultsFanout) { NSUserDefaults *m=zxMirrorDefaults(self); if(m){gZXDefaultsFanout=YES;[m setValue:value forKey:key];gZXDefaultsFanout=NO;} } }
+- (void)removeObjectForKey:(NSString *)key { %orig(key); if (!gZXDefaultsFanout) { NSUserDefaults *m=zxMirrorDefaults(self); if(m){gZXDefaultsFanout=YES;[m removeObjectForKey:key];gZXDefaultsFanout=NO;} } }
+- (BOOL)synchronize { BOOL ok=%orig; if (!gZXDefaultsFanout) { NSUserDefaults *m=zxMirrorDefaults(self); if(m){gZXDefaultsFanout=YES;BOOL mOK=[m synchronize];gZXDefaultsFanout=NO;ok=ok&&mOK;} } return ok; }
 %end
 
 %ctor {
-	initializeAppGroupMapping();
+	migrateLegacyMobileConfigIfNeeded();
+	rebindPathFuncs();
 	%init;
 }
