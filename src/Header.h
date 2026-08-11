@@ -1,5 +1,9 @@
 #import <Foundation/Foundation.h>
 
+#ifdef __cplusplus
+#include <chrono>
+#endif
+
 extern NSString *accessGroupId;
 extern NSString *bundleId;
 
