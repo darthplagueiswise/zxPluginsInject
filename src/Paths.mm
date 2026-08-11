@@ -11,7 +11,8 @@ static __thread BOOL gCanonicalizingSideloadPath = NO;
 // Subdirectories that must live inside the fake App Group container.
 // "mobileconfig_qce" is a sibling of "mobileconfig", not a child: a plain
 // prefix test on "mobileconfig" never matches it, because the character that
-// follows the prefix is '_' and not '/' or NUL.
+// follows the prefix is '_' and not '/' or NUL. It comes from the same
+// MobileConfig manager (bufferPathPostfix="qce"), same base directory.
 static NSString *const kRelocatedLeaves[] = { @"mobileconfig", @"mobileconfig_qce" };
 static const NSUInteger kRelocatedLeafCount = sizeof(kRelocatedLeaves) / sizeof(kRelocatedLeaves[0]);
 
@@ -149,18 +150,65 @@ static BOOL mergeLegacyItem(NSFileManager *fm, NSString *sourcePath, NSString *d
 	return NO;
 }
 
+// Every consumer we can enumerate gets routed to the canonical directory by
+// canonicalizedSideloadPath / rewriteMobileConfigPath. But some call sites
+// resolve which of the two candidate paths to use ("does the legacy path
+// exist?" - a question our own __status hook answers as YES once data has been
+// migrated there) and then keep using that literal legacy string for every
+// following call, including ones we either cannot intercept (calls made from
+// inside a system dylib's own shared-cache code, invisible to fishhook) or
+// chose not to intercept (the directory_iterator constructor: on Apple's
+// arm64 ABI a constructor returns `this` in x0, and a replacement that gets
+// that wrong corrupts the caller's object pointer instead of crashing
+// cleanly).
+//
+// Deleting the emptied legacy directory - what earlier revisions of this file
+// did - turns every one of those literal-path calls into ENOENT. For a
+// throwing API like the single-argument directory_iterator constructor that
+// means an uncaught std::filesystem::filesystem_error and an abort.
+//
+// The fix that needs no interception at all: turn the (now empty) legacy
+// directory into a symlink pointing at the canonical one. The kernel resolves
+// the indirection for every syscall - open, opendir, mkdir, unlink, rename,
+// realpath - regardless of which libc++ symbol issued it or whether we hooked
+// that symbol. A literal legacy path becomes indistinguishable from the
+// canonical one at the point every one of these APIs actually reads.
+//
+// The symlink check MUST use an API that does not itself follow symlinks.
+// -[NSFileManager fileExistsAtPath:isDirectory:] calls stat(), which resolves
+// the link and reports isDirectory=YES for it - on a second launch that would
+// send the already-relocated legacy path straight back into mergeLegacyItem,
+// which would list it (reading through the very link being tested), compare
+// each entry against the identical file at the canonical path, and delete it
+// as a merge "duplicate". destinationOfSymbolicLinkAtPath: uses lstat(), so it
+// only succeeds when the path itself is a link and never follows it.
 void migrateLegacyMobileConfigIfNeeded(void) {
 	initializePathConstants();
 	if (!getAppGroupPathIfExists()) return;
 	NSFileManager *fm = [NSFileManager defaultManager];
-	// Runs before %init, so NSFileManager is still unhooked here and these
-	// paths are the real ones on disk. That is what the migration needs.
 	for (NSArray<NSString *> *rule in gRelocationRules) {
-		mergeLegacyItem(fm, rule[0], rule[1]);
-	}
-	// Pre-create every destination so the host's "first candidate that exists
-	// wins" probe can never fall back to a directory outside the container.
-	for (NSUInteger i = 0; i < kRelocatedLeafCount; i++) {
-		createDirectoryIfNotExists([gAppGroupPath stringByAppendingPathComponent:kRelocatedLeaves[i]]);
+		NSString *legacyPath = rule[0];
+		NSString *canonicalPath = rule[1];
+		createDirectoryIfNotExists(canonicalPath);
+
+		NSString *existingDestination = [fm destinationOfSymbolicLinkAtPath:legacyPath error:nil];
+		if (existingDestination) {
+			if (![existingDestination isEqualToString:canonicalPath]) {
+				[fm removeItemAtPath:legacyPath error:nil];
+				[fm createSymbolicLinkAtPath:legacyPath withDestinationPath:canonicalPath error:nil];
+			}
+			continue;  // already relocated on a previous launch - nothing left to merge
+		}
+
+		BOOL isDirectory = NO;
+		if ([fm fileExistsAtPath:legacyPath isDirectory:&isDirectory] && isDirectory) {
+			mergeLegacyItem(fm, legacyPath, canonicalPath);
+		}
+		if (![fm fileExistsAtPath:legacyPath]) {
+			// Merge finished (or there was never anything here): safe to link.
+			[fm createSymbolicLinkAtPath:legacyPath withDestinationPath:canonicalPath error:nil];
+		}
+		// else: a real file/directory is still there because the merge did
+		// not fully succeed. Leave it alone - retried on the next launch.
 	}
 }
