@@ -183,6 +183,15 @@ static BOOL mergeLegacyItem(NSFileManager *fm, NSString *sourcePath, NSString *d
 // as a merge "duplicate". destinationOfSymbolicLinkAtPath: uses lstat(), so it
 // only succeeds when the path itself is a link and never follows it.
 void migrateLegacyMobileConfigIfNeeded(void) {
+	// Forum now gets the correct AppGroup root at the
+	// FBMobileConfigInitParams boundary (MobileConfigSessionlessFix.xm).
+	// Creating legacy symlinks here would make Documents/mobileconfig appear
+	// again even when the manager no longer writes there, obscuring the device
+	// verification and preserving the failed path-rewrite workaround.
+	if ([NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.facebook.agora"]) {
+		return;
+	}
+
 	initializePathConstants();
 	if (!getAppGroupPathIfExists()) return;
 	NSFileManager *fm = [NSFileManager defaultManager];
