@@ -8,6 +8,7 @@ extern void rebindPathFuncs(void);
 
 extern BOOL createDirectoryIfNotExists(NSString *path);
 extern NSURL *getAppGroupPathIfExists(void);
+extern NSString *standardizedSideloadPath(NSString *path);
 extern NSString *canonicalizedSideloadPath(NSString *path);
 extern NSURL *canonicalizedSideloadURL(NSURL *url);
 extern void migrateLegacyMobileConfigIfNeeded(void);
