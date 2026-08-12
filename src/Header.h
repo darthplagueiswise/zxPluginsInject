@@ -13,6 +13,11 @@ extern NSString *canonicalizedSideloadPath(NSString *path);
 extern NSURL *canonicalizedSideloadURL(NSURL *url);
 extern void migrateLegacyMobileConfigIfNeeded(void);
 
+// Forum-specific MobileConfig helpers. The implementation validates the host
+// bundle before returning a value or writing anything.
+extern NSString *zxCanonicalForumAppGroupRoot(void);
+extern void zxSeedForumIdNameMappingIfNeeded(NSString *containerRoot);
+
 @interface LSBundleProxy : NSObject
 @property(nonatomic, assign, readonly) NSDictionary *entitlements;
 @property(nonatomic, assign, readonly) NSDictionary *groupContainerURLs;

@@ -8,6 +8,10 @@ static NSArray<NSArray<NSString *> *> *gRelocationRules = nil;  // @[ @[legacyPr
 static dispatch_once_t gPathConstantsOnce;
 static __thread BOOL gCanonicalizingSideloadPath = NO;
 
+static BOOL zxIsForumPathHost(void) {
+	return [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.facebook.agora"];
+}
+
 // Subdirectories that must live inside the fake App Group container.
 // "mobileconfig_qce" is a sibling of "mobileconfig", not a child: a plain
 // prefix test on "mobileconfig" never matches it, because the character that
@@ -87,6 +91,10 @@ static BOOL pathIsEqualToOrInsidePath(NSString *path, NSString *prefix) {
 
 NSString *canonicalizedSideloadPath(NSString *path) {
 	if (path.length == 0 || gCanonicalizingSideloadPath) return path;
+	// Forum's MobileConfig base is corrected at FBMobileConfigInitParams. Once
+	// that semantic input is right, rewriting every later filesystem operation
+	// only hides regressions and can interfere with Foundation's temp files.
+	if (zxIsForumPathHost()) return path;
 	gCanonicalizingSideloadPath = YES;
 	initializePathConstants();
 	NSString *standardized = standardizedSideloadPath(path);
@@ -101,6 +109,48 @@ NSString *canonicalizedSideloadPath(NSString *path) {
 	}
 	gCanonicalizingSideloadPath = NO;
 	return result;
+}
+
+static BOOL zxIsStaleAtomicExtraName(NSString *name) {
+	if (name.length != 12 || ![name hasPrefix:@"Extra-"]) return NO;
+	NSCharacterSet *allowed = [NSCharacterSet alphanumericCharacterSet];
+	return [[name substringFromIndex:6] rangeOfCharacterFromSet:allowed.invertedSet].location == NSNotFound;
+}
+
+static void zxCleanupForumLegacyArtifacts(void) {
+	if (!zxIsForumPathHost()) return;
+	initializePathConstants();
+
+	NSFileManager *fm = NSFileManager.defaultManager;
+	for (NSString *root in @[gHomePath, gDocumentsPath]) {
+		for (NSString *leaf in @[@"mobileconfig", @"mobileconfig_qce"]) {
+			NSString *legacyPath = [root stringByAppendingPathComponent:leaf];
+			NSString *destination = [fm destinationOfSymbolicLinkAtPath:legacyPath error:nil];
+			if (destination.length) {
+				NSError *error = nil;
+				if (![fm removeItemAtPath:legacyPath error:&error] || error) {
+					NSLog(@"[zx][forum-mobileconfig] cannot remove legacy symlink %@: %@", legacyPath, error);
+				}
+			}
+		}
+	}
+
+	// NSDataWritingAtomic names its temporary siblings Extra-XXXXXX. Remove
+	// only regular, zero-byte leftovers from prior failed builds; never touch a
+	// directory, non-empty file, or a less-specific name.
+	NSError *listError = nil;
+	NSArray<NSString *> *children = [fm contentsOfDirectoryAtPath:gAppGroupPath error:&listError];
+	if (listError) return;
+	for (NSString *name in children) {
+		if (!zxIsStaleAtomicExtraName(name)) continue;
+		NSString *path = [gAppGroupPath stringByAppendingPathComponent:name];
+		NSDictionary *attributes = [fm attributesOfItemAtPath:path error:nil];
+		if (![attributes[NSFileType] isEqualToString:NSFileTypeRegular] ||
+			[attributes[NSFileSize] unsignedLongLongValue] != 0) {
+			continue;
+		}
+		[fm removeItemAtPath:path error:nil];
+	}
 }
 
 NSURL *canonicalizedSideloadURL(NSURL *url) {
@@ -188,7 +238,8 @@ void migrateLegacyMobileConfigIfNeeded(void) {
 	// Creating legacy symlinks here would make Documents/mobileconfig appear
 	// again even when the manager no longer writes there, obscuring the device
 	// verification and preserving the failed path-rewrite workaround.
-	if ([NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.facebook.agora"]) {
+	if (zxIsForumPathHost()) {
+		zxCleanupForumLegacyArtifacts();
 		return;
 	}
 

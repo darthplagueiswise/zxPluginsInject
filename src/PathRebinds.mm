@@ -148,6 +148,13 @@ static void zxAddRule(NSString *legacyPrefix, NSString *canonicalPrefix) {
 void rebindPathFuncs(void) {
 	static dispatch_once_t onceToken;
 	dispatch_once(&onceToken, ^{
+		// Forum is routed at FBMobileConfigInitParams. Its captured build no
+		// longer needs broad libc/libc++ path interception once that input is
+		// corrected.
+		if ([NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.facebook.agora"]) {
+			return;
+		}
+
 		const char *homeCString = getenv("HOME");
 		NSString *home = homeCString ? [NSString stringWithUTF8String:homeCString] : nil;
 		if (home.length == 0) home = NSHomeDirectory();

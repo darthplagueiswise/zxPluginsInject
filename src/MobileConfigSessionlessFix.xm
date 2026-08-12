@@ -2,6 +2,8 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 
+#import "Header.h"
+
 // Forum (com.facebook.agora) registers an XPlugins provider for key
 // 0x495bbe12 that returns nil. Its sessionless bootstrap consequently passes
 // NSDocumentDirectory to FBMobileConfigInitParams. Account/admin managers use
@@ -63,7 +65,9 @@ static NSString *zxPathFromMETAAppGroup(void) {
 	return nil;
 }
 
-static NSString *zxCanonicalForumAppGroupRoot(void) {
+NSString *zxCanonicalForumAppGroupRoot(void) {
+	if (!zxIsForumHost()) return nil;
+
 	NSString *root = zxPathFromMETAAppGroup();
 	if (!root.length) {
 		// Do not depend on the older path-rebinding workaround here. This is the
@@ -116,7 +120,8 @@ static NSString *zxBundledForumParamsNamesPath(void) {
 // representation in params_maps/params_names_v4_u0.txt, while both captured
 // runtime cache files contain [] and the global file is absent. Seed only a
 // missing/invalid global map; a later successful refresh can replace it.
-static void zxSeedForumIdNameMappingIfNeeded(NSString *containerRoot) {
+void zxSeedForumIdNameMappingIfNeeded(NSString *containerRoot) {
+	if (!zxIsForumHost()) return;
 	if (!containerRoot.length) return;
 
 	static NSObject *lock;
@@ -152,7 +157,11 @@ static void zxSeedForumIdNameMappingIfNeeded(NSString *containerRoot) {
 										  attributes:nil
 											   error:&error];
 		if (!error) {
-			[seed writeToFile:destination options:NSDataWritingAtomic error:&error];
+			// NSDataWritingAtomic creates AppGroup/Extra-XXXXXX while preparing
+			// the rename. The broad legacy path hooks used by older builds could
+			// leave that temporary file behind. This seed is immutable bundled
+			// data, so a direct write is sufficient and creates no Extra-* file.
+			[seed writeToFile:destination options:0 error:&error];
 		}
 		if (error) {
 			NSLog(@"[zx][forum-mobileconfig] cannot seed %@: %@", destination, error);
